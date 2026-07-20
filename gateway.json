@@ -1,0 +1,69 @@
+{
+  "listen": ":8443",
+  "routes": {
+    "tier-a-anthropic": {
+      "kind": "anthropic",
+      "base_url": "https://api.anthropic.com",
+      "key_env": "ANTHROPIC_API_KEY",
+      "allowed_models": ["claude-*"],
+      "max_request_mb": 20
+    },
+    "tier-a-openai": {
+      "kind": "openai",
+      "base_url": "https://api.openai.com/v1",
+      "key_env": "OPENAI_API_KEY",
+      "allowed_models": ["gpt-*", "o3*", "o4*"],
+      "max_request_mb": 20
+    },
+    "tier-a-google": {
+      "kind": "openai",
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "key_env": "GEMINI_API_KEY",
+      "allowed_models": ["gemini-*"],
+      "max_request_mb": 20
+    },
+    "tier-a-xai": {
+      "kind": "openai",
+      "base_url": "https://api.x.ai/v1",
+      "key_env": "XAI_API_KEY",
+      "allowed_models": ["grok-*"],
+      "max_request_mb": 20
+    },
+    "tier-a-mistral": {
+      "kind": "openai",
+      "base_url": "https://api.mistral.ai/v1",
+      "key_env": "MISTRAL_API_KEY",
+      "allowed_models": ["mistral-*", "magistral-*", "codestral-*", "devstral-*"],
+      "max_request_mb": 20
+    },
+    "tier-b-deepseek": {
+      "kind": "openai",
+      "base_url": "https://api.deepseek.com/v1",
+      "key_env": "DEEPSEEK_API_KEY",
+      "allowed_models": ["deepseek-*"],
+      "max_request_mb": 20
+    },
+    "tier-b-groq": {
+      "kind": "openai",
+      "base_url": "https://api.groq.com/openai/v1",
+      "key_env": "GROQ_API_KEY",
+      "max_request_mb": 20
+    },
+    "tier-b-openrouter": {
+      "kind": "openai",
+      "base_url": "https://openrouter.ai/api",
+      "key_env": "OPENROUTER_API_KEY",
+      "max_request_mb": 20
+    },
+    "tier-c-local": {
+      "kind": "openai",
+      "base_url": "http://127.0.0.1:11434/v1",
+      "key_env": "",
+      "allowed_models": ["devstral*", "qwen*"],
+      "max_request_mb": 20
+    }
+  },
+  "sessions": {
+    "dev-session-token-change-me": { "workspace": "demo", "route": "tier-a-anthropic" }
+  }
+}

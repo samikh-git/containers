@@ -1,0 +1,34 @@
+# Policy gateway container — for attaching to the sandboxes' INTERNAL docker
+# network so it is the only destination sandboxes can reach (DESIGN §8/§9):
+#
+#   docker network create --internal wsnet
+#   docker build -f Dockerfile.gateway -t policy-gateway:v1 .
+#   docker run -d --name gateway --network wsnet \
+#     -p 127.0.0.1:8444:8444 \
+#     -v $PWD/gateway.json:/etc/gateway/gateway.json:ro \
+#     -v gateway-audit:/var/lib/gateway \
+#     -e ANTHROPIC_API_KEY -e GATEWAY_ADMIN_TOKEN \
+#     policy-gateway:v1
+#
+# Sandboxes then run with Network="wsnet", GatewayURL="http://gateway:8443".
+#
+# Admin surface (8444): the listener is non-loopback inside the container,
+# so the binary REFUSES to start without GATEWAY_ADMIN_TOKEN — sandboxes on
+# wsnet can reach the port but cannot mint sessions without the token, which
+# only the router holds. The router reaches admin via the host loopback
+# publish (-p 127.0.0.1:8444:8444).
+
+FROM golang:1.26 AS build
+WORKDIR /src
+COPY go.mod ./
+COPY dataplane/ dataplane/
+COPY gateway/ gateway/
+COPY cmd/ cmd/
+RUN CGO_ENABLED=0 go build -o /gateway ./cmd/gateway
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /gateway /gateway
+WORKDIR /var/lib/gateway
+ENTRYPOINT ["/gateway", "--config", "/etc/gateway/gateway.json", \
+            "--ledger", "/var/lib/gateway/audit.jsonl", \
+            "--admin", "0.0.0.0:8444"]

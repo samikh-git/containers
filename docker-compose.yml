@@ -1,0 +1,40 @@
+# Packages the two pieces that ARE portable as plain containers: the policy
+# gateway and the sandbox-only network (DESIGN §9). Does NOT package the
+# router or storage — see scripts/demo.sh and the note in README.md for why
+# (ZFS needs host/VM kernel access; a container can't provide that).
+#
+# Usage:
+#   ANTHROPIC_API_KEY=sk-ant-… GATEWAY_ADMIN_TOKEN=$(openssl rand -hex 16) \
+#     docker compose up -d --build
+#
+# The gateway also needs a foot in the default bridge network so the HOST
+# (and the router running on the host) can resolve/reach it; wsnet stays
+# --internal so sandboxes attached to it reach nothing else.
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    container_name: gateway
+    networks:
+      - wsnet
+      - default
+    ports:
+      - "127.0.0.1:8444:8444"   # admin API — loopback only
+    environment:
+      - ANTHROPIC_API_KEY
+      - GATEWAY_ADMIN_TOKEN
+    volumes:
+      - ./gateway.local.json:/etc/gateway/gateway.json:ro
+      - gateway-audit:/var/lib/gateway
+    restart: unless-stopped
+
+networks:
+  wsnet:
+    name: wsnet       # fixed name: `router up --network wsnet` must match this exactly
+    driver: bridge
+    internal: true    # no route out — sandboxes attached here can reach only the gateway
+  default:
+
+volumes:
+  gateway-audit:

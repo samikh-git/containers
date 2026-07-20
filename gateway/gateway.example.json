@@ -1,0 +1,22 @@
+{
+  "listen": ":8443",
+  "routes": {
+    "tier-a-anthropic": {
+      "kind": "anthropic",
+      "base_url": "https://api.anthropic.com",
+      "key_env": "ANTHROPIC_API_KEY",
+      "allowed_models": ["claude-*"],
+      "max_request_mb": 20
+    },
+    "tier-c-local": {
+      "kind": "openai",
+      "base_url": "http://127.0.0.1:11434/v1",
+      "key_env": "",
+      "allowed_models": ["devstral*", "qwen*"],
+      "max_request_mb": 20
+    }
+  },
+  "sessions": {
+    "dev-session-token-change-me": { "workspace": "demo", "route": "tier-a-anthropic" }
+  }
+}

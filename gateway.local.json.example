@@ -1,0 +1,13 @@
+{
+  "listen": ":8443",
+  "routes": {
+    "tier-a": {
+      "kind": "anthropic",
+      "base_url": "https://api.anthropic.com",
+      "key_env": "ANTHROPIC_API_KEY",
+      "allowed_models": ["claude-*", "anthropic/*"],
+      "max_request_mb": 20
+    }
+  },
+  "sessions": {}
+}

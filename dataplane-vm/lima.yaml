@@ -1,0 +1,41 @@
+# Production data-plane VM (DESIGN §7): one Linux system — Docker + gVisor
+# (runsc) + ZFS — on the Mac Mini. Boot with:
+#
+#   brew install lima
+#   limactl disk create zfs-pool --size 200GiB    # must exist before start —
+#                                                   # additionalDisks references
+#                                                   # a pre-created Lima disk,
+#                                                   # it does not create one inline
+#   limactl start --name=dataplane dataplane-vm/lima.yaml
+#   limactl shell dataplane sudo bash /Users/$(whoami)/Developer/containerization/dataplane-vm/provision.sh
+#
+# The ZFS pool lives ENTIRELY on the dedicated additionalDisk below — never
+# on the shared ~ mount. That's deliberate: it avoids the exact host/VM path
+# sync issue hit on Docker Desktop, and ZFS needs its own block device, not a
+# passthrough filesystem.
+
+vmType: vz          # Apple Virtualization.framework — required for good
+                     # performance and for the extra virtio disk on Apple Silicon
+arch: aarch64
+
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: aarch64
+
+cpus: 6
+memory: "12GiB"
+disk: "40GiB"          # OS + Docker image cache only
+
+additionalDisks:
+  - name: "zfs-pool"
+    size: "200GiB"      # entirely dedicated to the ZFS pool — adjust to taste
+
+mounts:
+  - location: "~"
+    writable: true       # convenience: cross-compiled router/gateway binaries,
+                          # repo checkout, Dockerfiles. NOT for workspace data.
+
+containerd:
+  system: false
+  user: false            # we install Docker CE + configure daemon.json
+                          # ourselves in provision.sh, not Lima's containerd

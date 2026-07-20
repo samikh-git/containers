@@ -1,0 +1,19 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "anthropic": {
+      "options": {
+        "baseURL": "{env:OPENCODE_BASE_URL}",
+        "apiKey": "{env:OPENCODE_SESSION_TOKEN}"
+      }
+    },
+    "openrouter": {
+      "options": {
+        "baseURL": "{env:OPENCODE_BASE_URL}",
+        "apiKey": "{env:OPENCODE_SESSION_TOKEN}"
+      }
+    }
+  },
+  "model": "anthropic/claude-sonnet-4-5",
+  "permission": { "edit": "ask", "bash": "ask" }
+}
