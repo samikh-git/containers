@@ -21,7 +21,7 @@
 //	       web editor (see files.go)
 //	GET    /healthz
 //	GET    /                             end-user app (frontend/, embedded)
-//	GET    /admin                        operator page (workspaces, keys, cost, ops)
+//	GET    /admin                        operator console (frontend admin.html, Kumo)
 package restapi
 
 import (
@@ -41,11 +41,9 @@ import (
 	"containerization/dataplane"
 )
 
-//go:embed webui.html
-var webui embed.FS
-
-// The end-user app (frontend/ builds into dist/ via `npm run build`; vite's
-// outDir points here). Embedded so the router remains a single binary.
+// The end-user app and operator admin console (frontend/ builds into dist/
+// via `npm run build`; vite's outDir points here). Embedded so the router
+// remains a single binary.
 //
 //go:embed all:dist
 var appDist embed.FS
@@ -126,15 +124,20 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintln(w, "ok")
 	})
+	// End-user app + admin console: static assets from the embedded vite
+	// build. Admin is a separate MPA entry (admin.html); everything else
+	// falls through to the hash-routed SPA (index.html).
+	app, _ := fs.Sub(appDist, "dist")
+	assets := http.FileServer(http.FS(app))
 	mux.HandleFunc("GET /admin", func(w http.ResponseWriter, _ *http.Request) {
-		page, _ := webui.ReadFile("webui.html")
+		page, err := fs.ReadFile(app, "admin.html")
+		if err != nil {
+			http.Error(w, "admin UI not built: run `npm run build` in frontend/", http.StatusNotFound)
+			return
+		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Write(page)
 	})
-	// End-user app: static assets from the embedded vite build, index.html
-	// for everything else (hash-routed SPA).
-	app, _ := fs.Sub(appDist, "dist")
-	assets := http.FileServer(http.FS(app))
 	// Method-less on purpose: a "GET /" pattern is ambiguous against the
 	// method-less opencode proxy pattern above (ServeMux precedence).
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

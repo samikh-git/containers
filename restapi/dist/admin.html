@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en" data-theme="kumo" data-mode="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Workspace Router — Admin</title>
+    <script>
+      try {
+        var m = localStorage.getItem("admin-mode");
+        if (m !== "light" && m !== "dark")
+          m = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.dataset.mode = m;
+      } catch (e) {
+        document.documentElement.dataset.mode = "dark";
+      }
+    </script>
+    <script type="module" crossorigin src="/assets/admin-CxNfncAI.js"></script>
+    <link rel="modulepreload" crossorigin href="/assets/rolldown-runtime-QTnfLwEv.js">
+    <link rel="modulepreload" crossorigin href="/assets/jsx-runtime-CIxEorsV.js">
+    <link rel="modulepreload" crossorigin href="/assets/router-Spf6WvHz.js">
+    <link rel="stylesheet" crossorigin href="/assets/admin-bkI-Ydqv.css">
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>
