@@ -8,6 +8,7 @@
 //	POST   /api/workspaces/{id}/down     stop, volume preserved
 //	POST   /api/workspaces/{id}/hibernate graceful stop + snapshot + revoke
 //	DELETE /api/workspaces/{id}          destroy workspace, snapshots, branches
+//	GET    /api/usage                    cost/usage summary over the audit ledger
 //	GET    /api/keys                     gateway routes -> key present?
 //	PUT    /api/keys/{route}             set/rotate a provider key ({"key":"…"}; "" clears)
 //	GET    /api/routes                   gateway route metadata + key status
@@ -20,7 +21,7 @@
 //	       web editor (see files.go)
 //	GET    /healthz
 //	GET    /                             end-user app (frontend/, embedded)
-//	GET    /admin                        operator page (workspaces, keys, ops)
+//	GET    /admin                        operator page (workspaces, keys, cost, ops)
 package restapi
 
 import (
@@ -114,6 +115,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/keys/{route}", s.auth(s.setKey))
 	mux.HandleFunc("GET /api/routes", s.auth(s.routes))
 	mux.HandleFunc("GET /api/defaults", s.auth(s.defaults))
+	mux.HandleFunc("GET /api/usage", s.auth(s.usage))
 	// No method in the pattern: OpenCode's API is GET/POST/DELETE and may
 	// grow; the proxy forwards them all.
 	mux.HandleFunc("/api/workspaces/{id}/opencode/{rest...}", s.auth(s.opencode))

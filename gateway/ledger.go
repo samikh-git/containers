@@ -19,20 +19,22 @@ import (
 // the flight recorder, §11). Events are hash-chained: each carries the hash
 // of its predecessor, so truncation or in-place edits are detectable.
 type Event struct {
-	Seq        uint64    `json:"seq"`
-	Prev       string    `json:"prev"` // hex hash of previous event ("" for first)
-	Time       time.Time `json:"time"`
-	Workspace  string    `json:"workspace"`
-	Route      string    `json:"route"`
-	Model      string    `json:"model,omitempty"`
-	Upstream   string    `json:"upstream,omitempty"`
-	Outcome    string    `json:"outcome"` // "forwarded" | "blocked" | "upstream_error" | "auth_failed"
-	Reason     string    `json:"reason,omitempty"`
-	Status     int       `json:"status,omitempty"`
-	ReqBytes   int64     `json:"req_bytes,omitempty"`
-	RespBytes  int64     `json:"resp_bytes,omitempty"`
-	DurationMS int64     `json:"duration_ms,omitempty"`
-	Hash       string    `json:"hash"` // hex sha256 over the event with Hash=""
+	Seq          uint64    `json:"seq"`
+	Prev         string    `json:"prev"` // hex hash of previous event ("" for first)
+	Time         time.Time `json:"time"`
+	Workspace    string    `json:"workspace"`
+	Route        string    `json:"route"`
+	Model        string    `json:"model,omitempty"`
+	Upstream     string    `json:"upstream,omitempty"`
+	Outcome      string    `json:"outcome"` // "forwarded" | "blocked" | "upstream_error" | "auth_failed"
+	Reason       string    `json:"reason,omitempty"`
+	Status       int       `json:"status,omitempty"`
+	ReqBytes     int64     `json:"req_bytes,omitempty"`
+	RespBytes    int64     `json:"resp_bytes,omitempty"`
+	DurationMS   int64     `json:"duration_ms,omitempty"`
+	InputTokens  int64     `json:"input_tokens,omitempty"`  // prompt / input (when parseable)
+	OutputTokens int64     `json:"output_tokens,omitempty"` // completion / output
+	Hash         string    `json:"hash"`                    // hex sha256 over the event with Hash=""
 }
 
 // Ledger is an append-only, hash-chained JSONL file. Local mode writes it to
@@ -54,7 +56,7 @@ func OpenLedger(path string) (*Ledger, error) {
 	l := &Ledger{f: f}
 
 	// Resume chain state from existing content.
-	events, err := readEvents(path)
+	events, err := ReadEvents(path)
 	if err != nil {
 		f.Close()
 		return nil, fmt.Errorf("ledger %s unreadable: %w", path, err)
@@ -101,7 +103,7 @@ func (l *Ledger) Append(e Event) error {
 // Verify replays a ledger file and checks the chain: sequence continuity,
 // prev-linkage, and every event's hash. Returns the number of valid events.
 func Verify(path string) (int, error) {
-	events, err := readEvents(path)
+	events, err := ReadEvents(path)
 	if err != nil {
 		return 0, err
 	}
@@ -136,7 +138,10 @@ func hashEvent(e Event) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
-func readEvents(path string) ([]Event, error) {
+// ReadEvents loads every event from a ledger file. Missing files yield an
+// empty slice (not an error) so callers can summarize a ledger that has not
+// been written yet.
+func ReadEvents(path string) ([]Event, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {

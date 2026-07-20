@@ -92,6 +92,24 @@
   .gate-card form { display: flex; flex-direction: column; gap: 10px; }
   .gate-card .err { color: var(--bad); font-size: 12px; min-height: 1.2em; }
   .metric-miss { color: var(--dim); }
+  .stat-row {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 12px; margin-bottom: 16px;
+  }
+  .stat {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    padding: 10px 12px;
+  }
+  .stat .label { font-size: 11px; color: var(--dim); text-transform: uppercase;
+    letter-spacing: .06em; }
+  .stat .value { font-size: 18px; font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .stat .sub { font-size: 11px; color: var(--dim); margin-top: 2px; }
+  .usage-tables { display: grid; grid-template-columns: 1fr; gap: 16px; }
+  @media (min-width: 900px) {
+    .usage-tables { grid-template-columns: 1fr 1fr; }
+  }
+  .usage-tables h3 { font-size: 12px; color: var(--dim); margin: 0 0 8px;
+    text-transform: uppercase; letter-spacing: .06em; font-weight: 600; }
 </style>
 </head>
 <body>
@@ -170,6 +188,49 @@
       </table>
     </div>
     <div class="empty" id="empty" hidden>no sandboxes</div>
+  </section>
+
+  <section>
+    <h2>
+      Cost &amp; usage
+      <span class="grow"></span>
+      <label style="flex-direction:row;align-items:center;gap:6px;margin:0">
+        window
+        <select id="usageWindow">
+          <option value="1h">1h</option>
+          <option value="6h">6h</option>
+          <option value="24h" selected>24h</option>
+          <option value="7d">7d</option>
+          <option value="30d">30d</option>
+        </select>
+      </label>
+      <button type="button" id="usageRefresh">Refresh</button>
+    </h2>
+    <div id="usageUnavailable" class="empty" hidden></div>
+    <div id="usageBody">
+      <div class="stat-row" id="usageStats"></div>
+      <div class="hint" id="usageNote"></div>
+      <div class="usage-tables" style="margin-top:14px">
+        <div>
+          <h3>By workspace</h3>
+          <div style="overflow-x:auto">
+            <table>
+              <thead><tr><th>workspace</th><th>reqs</th><th>tokens</th><th>est. cost</th></tr></thead>
+              <tbody id="usageByWS"></tbody>
+            </table>
+          </div>
+        </div>
+        <div>
+          <h3>By model</h3>
+          <div style="overflow-x:auto">
+            <table>
+              <thead><tr><th>model</th><th>reqs</th><th>tokens</th><th>est. cost</th></tr></thead>
+              <tbody id="usageByModel"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
   </section>
 
   <section>
@@ -417,6 +478,86 @@
     return t.toLocaleString();
   }
 
+  // ---- cost & usage ------------------------------------------------------
+  function fmtUSD(n) {
+    if (n == null || Number.isNaN(n)) return '—';
+    if (n === 0) return '$0';
+    if (n < 0.01) return '$' + n.toFixed(4);
+    return '$' + n.toFixed(2);
+  }
+  function fmtTokens(n) {
+    if (n == null) return '—';
+    if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+    return String(n);
+  }
+  function usageBucketRows(tbody, buckets) {
+    tbody.innerHTML = '';
+    if (!buckets || buckets.length === 0) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = '<td colspan="4" class="empty">no traffic in window</td>';
+      tbody.appendChild(tr);
+      return;
+    }
+    for (const b of buckets) {
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td></td><td class="num"></td><td class="num"></td><td class="num"></td>';
+      tr.cells[0].textContent = b.key || '(none)';
+      tr.cells[1].textContent = String(b.requests || 0);
+      const tok = (b.input_tokens || 0) + (b.output_tokens || 0);
+      tr.cells[2].textContent = tok
+        ? fmtTokens(b.input_tokens || 0) + ' in / ' + fmtTokens(b.output_tokens || 0) + ' out'
+        : '—';
+      tr.cells[3].textContent = b.priced_requests ? fmtUSD(b.cost_usd) : '—';
+      tbody.appendChild(tr);
+    }
+  }
+
+  async function refreshUsage() {
+    const window = $('usageWindow').value;
+    try {
+      const u = await api('GET', '/api/usage?window=' + encodeURIComponent(window));
+      if (!u.available) {
+        $('usageBody').hidden = true;
+        $('usageUnavailable').hidden = false;
+        $('usageUnavailable').textContent = u.note || 'usage unavailable';
+        return;
+      }
+      $('usageUnavailable').hidden = true;
+      $('usageBody').hidden = false;
+      const t = u.total || {};
+      const priced = t.priced_requests || 0;
+      const unpriced = (t.forwarded || 0) - priced;
+      $('usageStats').innerHTML =
+        '<div class="stat"><div class="label">Est. cost</div>' +
+          '<div class="value">' + (priced ? fmtUSD(t.cost_usd) : '—') + '</div>' +
+          '<div class="sub">' + (priced ? priced + ' priced reqs' : 'no token counts yet') + '</div></div>' +
+        '<div class="stat"><div class="label">Requests</div>' +
+          '<div class="value">' + (t.requests || 0) + '</div>' +
+          '<div class="sub">' + (t.forwarded || 0) + ' fwd · ' + (t.blocked || 0) + ' blocked · ' +
+            (t.errors || 0) + ' err</div></div>' +
+        '<div class="stat"><div class="label">Input tokens</div>' +
+          '<div class="value">' + fmtTokens(t.input_tokens || 0) + '</div></div>' +
+        '<div class="stat"><div class="label">Output tokens</div>' +
+          '<div class="value">' + fmtTokens(t.output_tokens || 0) + '</div></div>';
+      let note = u.note || '';
+      if (unpriced > 0) {
+        note += (note ? ' · ' : '') + unpriced + ' forwarded request(s) lack token counts (pre-upgrade or unparseable)';
+      }
+      $('usageNote').textContent = note;
+      usageBucketRows($('usageByWS'), u.by_workspace);
+      usageBucketRows($('usageByModel'), u.by_model);
+    } catch (e) {
+      $('usageBody').hidden = true;
+      $('usageUnavailable').hidden = false;
+      $('usageUnavailable').textContent = e.message;
+    }
+  }
+
+  $('usageRefresh').addEventListener('click', refreshUsage);
+  $('usageWindow').addEventListener('change', refreshUsage);
+
   // ---- workspaces --------------------------------------------------------
   let rowBusy = new Set();
   let editingId = null; // pause table rebuild while inline fanout/destroy is open
@@ -621,15 +762,16 @@
     finally { btn.disabled = false; refresh(); }
   });
 
-  $('refresh').addEventListener('click', () => { refresh(); refreshKeys(); });
+  $('refresh').addEventListener('click', () => { refresh(); refreshKeys(); refreshUsage(); });
 
   let pollTimer = null;
   async function boot() {
     await loadDefaults();
     await refreshKeys();
     await refresh();
+    await refreshUsage();
     if (pollTimer) clearInterval(pollTimer);
-    pollTimer = setInterval(() => { refresh(); refreshKeys(); }, 5000);
+    pollTimer = setInterval(() => { refresh(); refreshKeys(); refreshUsage(); }, 5000);
   }
 
   (async () => {

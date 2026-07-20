@@ -64,7 +64,7 @@ func main() {
 		network   = fs.String("network", "", "docker network for sandboxes (create with --internal; empty = no network)")
 		idleAfter = fs.Duration("idle", 10*time.Minute, "watch: hibernate after this long fully idle")
 		interval  = fs.Duration("interval", 30*time.Second, "watch: probe interval")
-		ledger    = fs.String("ledger", "", "gateway audit ledger path — watch: model-traffic activity; serve: LastActivityAt on /api/workspaces")
+		ledger    = fs.String("ledger", "", "gateway audit ledger path — watch: model-traffic activity; serve: LastActivityAt + /api/usage cost metrics")
 		listen    = fs.String("listen", "127.0.0.1:8400", "serve: REST API listen address")
 		activity  = fs.String("activity", "", "terminal activity JSONL — serve appends, watch reads (default <root>/terminal-activity.jsonl)")
 		poolN     = fs.Int("pool-n", 2, "pool fill / serve auto-refill: target ready warm slots (0 disables serve auto-refill)")

@@ -35,13 +35,14 @@ review the agent's changes as diffs. Built on React + the official
 proxy. For UI development, `npm run dev` in `frontend/` proxies `/api` to a
 running `router serve`.
 
-The operator page (workspaces, fanout, provider keys, hibernate) lives at
-`/admin`. The API is plain JSON for scripting:
+The operator page (workspaces, fanout, provider keys, cost/usage, hibernate)
+lives at `/admin`. The API is plain JSON for scripting:
 
 ```sh
 curl -X POST localhost:8400/api/workspaces -d '{"id":"ws1"}'
 curl -X POST localhost:8400/api/workspaces/ws1/fanout -d '{"n":5}'
 curl        localhost:8400/api/workspaces
+curl        localhost:8400/api/usage?window=24h   # requires --ledger
 curl -X POST localhost:8400/api/workspaces/ws1/down
 curl -X DELETE localhost:8400/api/workspaces/ws1
 ```

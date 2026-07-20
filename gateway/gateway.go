@@ -386,18 +386,21 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	// Stream through, counting bytes and flushing (SSE-friendly).
+	// Stream through, counting bytes and flushing (SSE-friendly). Token
+	// counts are parsed best-effort from the two wire formats we own (§9).
 	for k, vs := range resp.Header {
 		for _, v := range vs {
 			w.Header().Add(k, v)
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	n := streamCopy(w, resp.Body)
+	n, inTok, outTok := streamCopyAndTap(w, resp.Body, route.Kind)
 
 	ev.Outcome = "forwarded"
 	ev.Status = resp.StatusCode
 	ev.RespBytes = n
+	ev.InputTokens = inTok
+	ev.OutputTokens = outTok
 	ev.DurationMS = time.Since(start).Milliseconds()
 	s.record(ev)
 }
