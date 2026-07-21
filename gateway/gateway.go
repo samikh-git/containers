@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path"
@@ -11,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"containerization/internal/applog"
 )
 
 // Route is one model upstream: a §9 tier decision made concrete. Kind
@@ -307,7 +310,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	token := bearerOrAPIKey(r)
 	sess, ok := s.lookupSession(token)
 	if !ok {
-		s.record(Event{Outcome: "auth_failed", Reason: "unknown session token", Status: http.StatusUnauthorized})
+		reason := "unknown session token"
+		if token == "" {
+			reason = "missing session token"
+		}
+		slog.Warn("gateway auth failed",
+			"reason", reason,
+			"token", applog.TokenPrefix(token),
+			"method", r.Method,
+			"path", r.URL.Path,
+			"remote", r.RemoteAddr,
+			"sessions", s.sessionCount(),
+		)
+		s.record(Event{Outcome: "auth_failed", Reason: reason, Status: http.StatusUnauthorized})
 		http.Error(w, "unknown session token", http.StatusUnauthorized)
 		return
 	}
@@ -317,6 +332,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// route's own cap is enforced below, once we know which route forwards it.
 	body, err := io.ReadAll(io.LimitReader(r.Body, sess.readCap(s.Config)<<20+1))
 	if err != nil {
+		slog.Warn("gateway read error", "workspace", sess.Workspace, "err", err)
 		http.Error(w, "read error", http.StatusBadRequest)
 		return
 	}
@@ -329,6 +345,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		ev.Outcome, ev.Reason, ev.Status = "blocked", "model not accepted by any route", http.StatusForbidden
 		s.record(ev)
+		slog.Warn("gateway blocked request",
+			"workspace", sess.Workspace, "model", ev.Model, "reason", ev.Reason, "status", ev.Status)
 		http.Error(w, fmt.Sprintf("model %q not allowed for this workspace", ev.Model), http.StatusForbidden)
 		return
 	}
@@ -342,6 +360,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if int64(len(body)) > maxBytes<<20 {
 		ev.Outcome, ev.Reason, ev.Status = "blocked", "request exceeds size cap", http.StatusRequestEntityTooLarge
 		s.record(ev)
+		slog.Warn("gateway blocked request",
+			"workspace", sess.Workspace, "route", routeName, "reason", ev.Reason, "status", ev.Status)
 		http.Error(w, "request exceeds size cap", http.StatusRequestEntityTooLarge)
 		return
 	}
@@ -352,6 +372,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if re.Match(body) {
 			ev.Outcome, ev.Reason, ev.Status = "blocked", "secret pattern in outbound prompt: "+re.String(), http.StatusForbidden
 			s.record(ev)
+			slog.Warn("gateway blocked request",
+				"workspace", sess.Workspace, "route", routeName, "reason", "secret pattern detected", "status", ev.Status)
 			http.Error(w, "outbound request blocked: secret pattern detected", http.StatusForbidden)
 			return
 		}
@@ -361,11 +383,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	up, err := http.NewRequestWithContext(r.Context(), r.Method,
 		strings.TrimRight(route.BaseURL, "/")+path.Clean("/"+r.URL.Path), strings.NewReader(string(body)))
 	if err != nil {
+		slog.Error("gateway bad upstream request", "workspace", sess.Workspace, "route", routeName, "err", err)
 		http.Error(w, "bad upstream request", http.StatusInternalServerError)
 		return
 	}
 	copyProxyHeaders(up.Header, r.Header)
 	key := s.routeKey(routeName)
+	if key == "" {
+		slog.Warn("gateway route has no provider key",
+			"workspace", sess.Workspace, "route", routeName, "key_env", route.KeyEnv)
+	}
 	switch route.Kind {
 	case "anthropic":
 		up.Header.Set("x-api-key", key)
@@ -381,6 +408,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ev.Outcome, ev.Reason, ev.Status = "upstream_error", err.Error(), http.StatusBadGateway
 		ev.DurationMS = time.Since(start).Milliseconds()
 		s.record(ev)
+		slog.Error("gateway upstream unreachable",
+			"workspace", sess.Workspace, "route", routeName, "upstream", route.BaseURL, "err", err)
 		http.Error(w, "upstream unreachable", http.StatusBadGateway)
 		return
 	}
@@ -403,13 +432,34 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ev.OutputTokens = outTok
 	ev.DurationMS = time.Since(start).Milliseconds()
 	s.record(ev)
+
+	attrs := []any{
+		"workspace", sess.Workspace,
+		"route", routeName,
+		"model", ev.Model,
+		"status", resp.StatusCode,
+		"duration_ms", ev.DurationMS,
+		"req_bytes", ev.ReqBytes,
+		"resp_bytes", n,
+	}
+	if resp.StatusCode >= 400 {
+		slog.Warn("gateway upstream error response", attrs...)
+	} else {
+		slog.Info("gateway forwarded", attrs...)
+	}
+}
+
+func (s *Server) sessionCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.sessions)
 }
 
 func (s *Server) record(e Event) {
 	if err := s.Ledger.Append(e); err != nil {
 		// v1 local mode is fail-open with a loud stderr; the org-policy
 		// fail-closed mode arrives with the buffered shipper (§11).
-		fmt.Fprintf(os.Stderr, "gateway: LEDGER WRITE FAILED: %v\n", err)
+		slog.Error("gateway ledger write failed", "err", err)
 	}
 }
 

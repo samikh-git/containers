@@ -17,17 +17,28 @@ From the Mac host (repo under `~/…` so Lima can mount it):
 ```
 
 Prompts for runtime (`gvisor` recommended), disk size, API key, warm pool,
-UI port-forward, and an optional smoke workspace. Always starts the policy
-gateway and `router serve`, and fails the install if the API never comes up.
-Re-runnable — skips work that is already done. Inside-VM package setup
-remains in `provision.sh`; the installer orchestrates the host-side half
-(Lima disk/VM, cross-compile, images, gateway wiring).
+UI port-forward, optional Cloudflare Tunnel (DESIGN §6 tunnel mode), and an
+optional smoke workspace. Always starts the policy gateway and `router serve`,
+and fails the install if the API never comes up. Re-runnable — skips work that
+is already done. Inside-VM package setup remains in `provision.sh`; the
+installer orchestrates the host-side half (Lima disk/VM, cross-compile,
+images, gateway wiring).
 
 Non-interactive example:
 
 ```sh
 RUNTIME=gvisor FILL_POOL=yes EXPOSE_UI=yes \
   ANTHROPIC_API_KEY=sk-ant-… ./dataplane-vm/install.sh
+```
+
+With a Cloudflare Tunnel (token from **Networking → Tunnels → Create**;
+dashboard Published application Service URL must be `http://127.0.0.1:8400`):
+
+```sh
+DEPLOY_TUNNEL=yes TUNNEL_HOSTNAME=app.example.com \
+  CLOUDFLARE_TUNNEL_TOKEN=eyJ… \
+  RUNTIME=gvisor EXPOSE_UI=yes ANTHROPIC_API_KEY=sk-ant-… \
+  ./dataplane-vm/install.sh
 ```
 
 Manual steps below are the same flow, expanded.

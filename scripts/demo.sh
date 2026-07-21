@@ -41,13 +41,32 @@ need() { command -v "$1" >/dev/null || { echo "missing required tool: $1" >&2; e
 need docker; need go; need jq; need curl
 
 ensure_env() {
+  # .demo/.env = GATEWAY_ADMIN_TOKEN. Root .env = API keys (sourced last).
   if [ ! -f "$ENV_FILE" ]; then
-    : "${ANTHROPIC_API_KEY:?Set ANTHROPIC_API_KEY before first run (gateway needs it to reach the model).}"
-    printf 'ANTHROPIC_API_KEY=%s\nGATEWAY_ADMIN_TOKEN=%s\n' \
-      "$ANTHROPIC_API_KEY" "$(openssl rand -hex 16)" > "$ENV_FILE"
-    echo "wrote $ENV_FILE (holds your API key + a generated admin token — not committed, see .gitignore)"
+    if [ -f "$REPO/.env" ]; then
+      set -a; # shellcheck disable=SC1091
+      source "$REPO/.env"
+      set +a
+    fi
+    : "${ANTHROPIC_API_KEY:?Set ANTHROPIC_API_KEY in $REPO/.env (or the environment) before first run.}"
+    {
+      printf 'GATEWAY_ADMIN_TOKEN=%s\n' "$(openssl rand -hex 16)"
+      if [ ! -f "$REPO/.env" ]; then
+        printf 'ANTHROPIC_API_KEY=%s\n' "$ANTHROPIC_API_KEY"
+      fi
+    } > "$ENV_FILE"
+    echo "wrote $ENV_FILE (GATEWAY_ADMIN_TOKEN — not committed, see .gitignore)"
   fi
-  set -a; source "$ENV_FILE"; set +a
+  if [ -f "$ENV_FILE" ]; then
+    set -a; # shellcheck disable=SC1091
+    source "$ENV_FILE"
+    set +a
+  fi
+  if [ -f "$REPO/.env" ]; then
+    set -a; # shellcheck disable=SC1091
+    source "$REPO/.env"
+    set +a
+  fi
 }
 
 cmd_build() {
@@ -77,7 +96,7 @@ cmd_up() {
   GATEWAY_ADMIN_TOKEN="$GATEWAY_ADMIN_TOKEN" "$ROUTER" up --id "$WS_ID" \
     --storage dir --root "$WORKDIR/wsdata" --runtime "$RT" \
     --network wsnet --gateway http://gateway:8443 --gateway-admin http://127.0.0.1:8444 \
-    --route tier-a --profile "$REPO/examples/profile" --image "$IMAGE"
+    --route tier-a,tier-b-openrouter --profile "$REPO/examples/profile" --image "$IMAGE"
 
   if [ "$RT" = "runc" ]; then
     echo

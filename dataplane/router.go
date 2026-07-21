@@ -3,6 +3,7 @@ package dataplane
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 )
@@ -59,6 +60,7 @@ func (r *Router) prepareSession(ctx context.Context, spec *WorkspaceSpec) error 
 		return err
 	}
 	spec.SessionToken = token
+	slog.Debug("workspace session prepared", "workspace", spec.ID, "routes", routes)
 	return nil
 }
 
@@ -69,7 +71,7 @@ func (r *Router) revokeSessions(ctx context.Context, wsID string) {
 	// Best-effort: a failed revoke must not block a stop, but it must be
 	// loud — an unrevoked token is a policy gap until the gateway restarts.
 	if err := r.Sessions.RevokeWorkspace(ctx, wsID); err != nil {
-		fmt.Printf("warning: revoking sessions for %s: %v\n", wsID, err)
+		slog.Warn("revoking sessions failed", "workspace", wsID, "err", err)
 	}
 }
 

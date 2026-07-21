@@ -23,6 +23,7 @@ WORKDIR /src
 COPY go.mod ./
 COPY dataplane/ dataplane/
 COPY gateway/ gateway/
+COPY internal/ internal/
 COPY cmd/ cmd/
 RUN CGO_ENABLED=0 go build -o /gateway ./cmd/gateway
 

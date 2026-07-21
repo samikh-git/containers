@@ -2,8 +2,11 @@ package gateway
 
 import (
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"strings"
+
+	"containerization/internal/applog"
 )
 
 // AdminHandler is the router-facing control surface: register a session
@@ -29,6 +32,7 @@ type AdminHandler struct {
 
 func (a *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if a.Token != "" && r.Header.Get("Authorization") != "Bearer "+a.Token {
+		slog.Warn("gateway admin auth failed", "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)
 		http.Error(w, "admin authorization required", http.StatusUnauthorized)
 		return
 	}
@@ -42,18 +46,28 @@ func (a *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil ||
 			req.Token == "" || req.Workspace == "" || (req.Route == "" && len(req.Routes) == 0) {
+			slog.Warn("gateway admin register rejected", "reason", "invalid body")
 			http.Error(w, "token, workspace and at least one route are required", http.StatusBadRequest)
 			return
 		}
 		if err := a.Server.AddSession(req.Token, Session{Workspace: req.Workspace, Route: req.Route, Routes: req.Routes}); err != nil {
+			slog.Warn("gateway admin register failed",
+				"workspace", req.Workspace, "token", applog.TokenPrefix(req.Token), "err", err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		routes := req.Routes
+		if len(routes) == 0 && req.Route != "" {
+			routes = []string{req.Route}
+		}
+		slog.Info("gateway session registered",
+			"workspace", req.Workspace, "token", applog.TokenPrefix(req.Token), "routes", routes)
 		w.WriteHeader(http.StatusCreated)
 
 	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/sessions/"):
 		token := strings.TrimPrefix(r.URL.Path, "/sessions/")
 		a.Server.RemoveSession(token)
+		slog.Info("gateway session revoked", "token", applog.TokenPrefix(token))
 		w.WriteHeader(http.StatusNoContent)
 
 	case r.Method == http.MethodDelete && r.URL.Path == "/sessions":
@@ -63,6 +77,7 @@ func (a *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		n := a.Server.RemoveWorkspaceSessions(ws)
+		slog.Info("gateway workspace sessions revoked", "workspace", ws, "revoked", n)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]int{"revoked": n})
 
@@ -76,9 +91,15 @@ func (a *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := a.Server.SetRouteKey(route, req.Key); err != nil {
+			slog.Warn("gateway set key failed", "route", route, "err", err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		action := "set"
+		if req.Key == "" {
+			action = "cleared"
+		}
+		slog.Info("gateway provider key updated", "route", route, "action", action)
 		w.WriteHeader(http.StatusNoContent)
 
 	case r.Method == http.MethodGet && r.URL.Path == "/keys":

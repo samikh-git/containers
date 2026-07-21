@@ -30,6 +30,9 @@ FILL_POOL="${FILL_POOL:-}"
 POOL_N="${POOL_N:-2}"
 SMOKE_UP="${SMOKE_UP:-}"
 EXPOSE_UI="${EXPOSE_UI:-}"
+DEPLOY_TUNNEL="${DEPLOY_TUNNEL:-}"   # Cloudflare Tunnel (DESIGN §6 tunnel mode)
+CLOUDFLARE_TUNNEL_TOKEN="${CLOUDFLARE_TUNNEL_TOKEN:-}"
+TUNNEL_HOSTNAME="${TUNNEL_HOSTNAME:-}"  # public hostname (dashboard route); docs only
 BUILD_FRONTEND="${BUILD_FRONTEND:-}"
 UI_PORT="${UI_PORT:-8400}"
 ROUTE="tier-a"
@@ -220,6 +223,22 @@ gather_plan() {
     fi
   fi
 
+  if [[ -z "$DEPLOY_TUNNEL" ]]; then
+    warn "Cloudflare Tunnel = DESIGN §6 tunnel mode (TLS terminates at Cloudflare; sovereignty opt-out)"
+    if confirm "Deploy Cloudflare Tunnel (expose UI via cloudflared in the VM)?" "N"; then
+      DEPLOY_TUNNEL=yes
+    else
+      DEPLOY_TUNNEL=no
+    fi
+  fi
+  if [[ "$DEPLOY_TUNNEL" == "yes" ]]; then
+    if [[ -z "$TUNNEL_HOSTNAME" ]] && is_tty; then
+      ask "Public hostname for the UI (optional; configure the same in the dashboard)" ""
+      TUNNEL_HOSTNAME="$REPLY"
+    fi
+    ensure_tunnel_token_plan
+  fi
+
   if [[ -z "$SMOKE_UP" ]]; then
     if confirm "Create a smoke-test workspace (id: smoke)?" "N"; then
       SMOKE_UP=yes
@@ -233,6 +252,7 @@ gather_plan() {
   info "  runtime=$RUNTIME  disk=$DISK_NAME ($DISK_SIZE)  vm=$VM_NAME"
   info "  frontend=$BUILD_FRONTEND  warm_pool=$FILL_POOL($POOL_N)"
   info "  serve=yes (always)  expose_ui=$EXPOSE_UI  smoke=$SMOKE_UP"
+  info "  cloudflare_tunnel=$DEPLOY_TUNNEL${TUNNEL_HOSTNAME:+ ($TUNNEL_HOSTNAME)}"
   if ! confirm "Proceed?" "Y"; then
     die "aborted"
   fi
@@ -267,15 +287,53 @@ ensure_secrets_plan() {
     info "GATEWAY_ADMIN_TOKEN already set"
   fi
 
-  # Rewrite .env with the keys we will use (preserve unrelated lines).
+  write_env_file
+}
+
+ensure_tunnel_token_plan() {
+  # Load existing .env without clobbering already-exported vars.
+  if [[ -f "$ENV_FILE" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    set +a
+  fi
+  CLOUDFLARE_TUNNEL_TOKEN="${CLOUDFLARE_TUNNEL_TOKEN:-}"
+
+  if [[ -z "$CLOUDFLARE_TUNNEL_TOKEN" ]]; then
+    if is_tty; then
+      cat <<EOF
+  Create a remotely-managed tunnel in the Cloudflare dashboard, then paste
+  its install token here:
+    https://dash.cloudflare.com/?to=/:account/tunnels
+  After install, add a Published application route with Service URL:
+    http://127.0.0.1:${UI_PORT}
+EOF
+      ask "Cloudflare Tunnel token (stored in $ENV_FILE)" ""
+      CLOUDFLARE_TUNNEL_TOKEN="$REPLY"
+      [[ -n "$CLOUDFLARE_TUNNEL_TOKEN" ]] || die "CLOUDFLARE_TUNNEL_TOKEN is required when DEPLOY_TUNNEL=yes"
+    else
+      die "set CLOUDFLARE_TUNNEL_TOKEN in the environment or $ENV_FILE (or DEPLOY_TUNNEL=no)"
+    fi
+  else
+    info "CLOUDFLARE_TUNNEL_TOKEN already set"
+  fi
+  write_env_file
+}
+
+write_env_file() {
+  mkdir -p "$RUN_DIR"
   local tmp
   tmp="$(mktemp)"
   if [[ -f "$ENV_FILE" ]]; then
-    grep -vE '^(ANTHROPIC_API_KEY|GATEWAY_ADMIN_TOKEN)=' "$ENV_FILE" >"$tmp" || true
+    grep -vE '^(ANTHROPIC_API_KEY|GATEWAY_ADMIN_TOKEN|CLOUDFLARE_TUNNEL_TOKEN|TUNNEL_HOSTNAME)=' \
+      "$ENV_FILE" >"$tmp" || true
   fi
   {
-    printf 'ANTHROPIC_API_KEY=%s\n' "$ANTHROPIC_API_KEY"
-    printf 'GATEWAY_ADMIN_TOKEN=%s\n' "$GATEWAY_ADMIN_TOKEN"
+    [[ -n "${ANTHROPIC_API_KEY:-}" ]] && printf 'ANTHROPIC_API_KEY=%s\n' "$ANTHROPIC_API_KEY"
+    [[ -n "${GATEWAY_ADMIN_TOKEN:-}" ]] && printf 'GATEWAY_ADMIN_TOKEN=%s\n' "$GATEWAY_ADMIN_TOKEN"
+    [[ -n "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]] && printf 'CLOUDFLARE_TUNNEL_TOKEN=%s\n' "$CLOUDFLARE_TUNNEL_TOKEN"
+    [[ -n "${TUNNEL_HOSTNAME:-}" ]] && printf 'TUNNEL_HOSTNAME=%s\n' "$TUNNEL_HOSTNAME"
   } >>"$tmp"
   mv "$tmp" "$ENV_FILE"
   chmod 600 "$ENV_FILE"
@@ -478,6 +536,8 @@ write_run_helpers() {
   cat >"$RUN_DIR/env" <<EOF
 ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY
 GATEWAY_ADMIN_TOKEN=$GATEWAY_ADMIN_TOKEN
+CLOUDFLARE_TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN:-}
+TUNNEL_HOSTNAME=${TUNNEL_HOSTNAME:-}
 EOF
   chmod 600 "$RUN_DIR/env"
 
@@ -574,9 +634,64 @@ nohup "\$BIN_DIR/router" serve "\${COMMON[@]}" \\
   --listen "127.0.0.1:\${UI_PORT}" "\${POOL_FLAG[@]}" \\
   >"\$RUN_DIR/serve.log" 2>&1 &
 echo \$! >"\$RUN_DIR/serve.pid"
-echo "router serve started pid=\$(cat "\$RUN_DIR/serve.pid") log=\$RUN_DIR/serve.log"
+  echo "router serve started pid=\$(cat "\$RUN_DIR/serve.pid") log=\$RUN_DIR/serve.log"
 EOF
   chmod +x "$RUN_DIR/start-serve.sh"
+
+  cat >"$RUN_DIR/start-tunnel.sh" <<EOF
+#!/usr/bin/env bash
+# Remotely-managed Cloudflare Tunnel (DESIGN §6 tunnel mode).
+# Installs cloudflared from pkg.cloudflare.com and runs:
+#   cloudflared service install <token>
+# Public hostname / Service URL are configured in the Cloudflare dashboard
+# (Service URL must be http://127.0.0.1:${UI_PORT}).
+set -euo pipefail
+RUN_DIR="$RUN_DIR"
+UI_PORT="$UI_PORT"
+# shellcheck disable=SC1091
+source "\$RUN_DIR/env"
+: "\${CLOUDFLARE_TUNNEL_TOKEN:?CLOUDFLARE_TUNNEL_TOKEN missing in \$RUN_DIR/env}"
+
+if ! command -v cloudflared >/dev/null 2>&1; then
+  echo "installing cloudflared (Ubuntu noble package repo)"
+  mkdir -p /usr/share/keyrings
+  curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \\
+    | tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+  echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared noble main' \\
+    > /etc/apt/sources.list.d/cloudflared.list
+  apt-get update -qq
+  DEBIAN_FRONTEND=noninteractive apt-get install -y cloudflared
+fi
+cloudflared --version
+
+if systemctl is-active --quiet cloudflared 2>/dev/null; then
+  echo "cloudflared service already active"
+  systemctl status cloudflared --no-pager -l | head -n 12 || true
+  exit 0
+fi
+
+# Remotely-managed tunnel: token embeds tunnel id + credentials.
+# Only one cloudflared systemd unit may exist per host.
+if systemctl list-unit-files cloudflared.service >/dev/null 2>&1 \\
+   || [[ -f /etc/systemd/system/cloudflared.service ]]; then
+  cloudflared service uninstall 2>/dev/null || true
+fi
+
+cloudflared service install "\$CLOUDFLARE_TUNNEL_TOKEN"
+systemctl enable --now cloudflared 2>/dev/null || systemctl start cloudflared
+
+for _ in \$(seq 1 30); do
+  if systemctl is-active --quiet cloudflared; then
+    echo "cloudflared is active — set dashboard Published application Service URL to http://127.0.0.1:\${UI_PORT}"
+    exit 0
+  fi
+  sleep 1
+done
+echo "cloudflared failed to become active; journal:" >&2
+journalctl -u cloudflared -n 40 --no-pager >&2 || true
+exit 1
+EOF
+  chmod +x "$RUN_DIR/start-tunnel.sh"
 }
 
 start_gateway() {
@@ -671,6 +786,43 @@ smoke_workspace() {
   info "workspace 'smoke' is up"
 }
 
+# ---------------------------------------------------------------------------
+# Cloudflare Tunnel (DESIGN §6 tunnel mode — convenience opt-out)
+# ---------------------------------------------------------------------------
+
+ensure_cloudflare_tunnel() {
+  say "Cloudflare Tunnel"
+  if [[ "$DEPLOY_TUNNEL" != "yes" ]]; then
+    info "skipped"
+    return
+  fi
+  [[ -n "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]] \
+    || die "DEPLOY_TUNNEL=yes but CLOUDFLARE_TUNNEL_TOKEN is empty"
+
+  if vm_root systemctl is-active --quiet cloudflared 2>/dev/null; then
+    info "cloudflared already active in the VM"
+    if confirm "Reinstall Cloudflare Tunnel service (new token / force)?" "N"; then
+      vm_root cloudflared service uninstall 2>/dev/null || true
+    else
+      info "keeping existing tunnel connector"
+      if [[ -n "${TUNNEL_HOSTNAME:-}" ]]; then
+        info "expected public URL: https://$TUNNEL_HOSTNAME/"
+      fi
+      return
+    fi
+  fi
+
+  info "installing/running cloudflared inside the VM (token-based / remotely managed)"
+  vm_root bash "$RUN_DIR/start-tunnel.sh"
+  info "tunnel connector is up"
+  if [[ -n "${TUNNEL_HOSTNAME:-}" ]]; then
+    info "configure dashboard route: $TUNNEL_HOSTNAME → http://127.0.0.1:$UI_PORT"
+  else
+    info "configure a Published application in the dashboard → http://127.0.0.1:$UI_PORT"
+  fi
+  info "docs: https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/get-started/create-remote-tunnel/"
+}
+
 print_done() {
   say "done — server is running"
   cat <<EOF
@@ -679,6 +831,7 @@ print_done() {
   Secrets:  $ENV_FILE
   Helpers:  $RUN_DIR/start-gateway.sh
             $RUN_DIR/start-serve.sh
+            $RUN_DIR/start-tunnel.sh
 
   Gateway URL for sandboxes: $(gateway_url)
   Runtime:                   $RUNTIME
@@ -692,6 +845,17 @@ EOF
     echo "  Forward later:"
     echo "    limactl show-ssh --format=config $VM_NAME > $RUN_DIR/lima-ssh.config"
     echo "    ssh -F $RUN_DIR/lima-ssh.config -N -L ${UI_PORT}:127.0.0.1:${UI_PORT} lima-$VM_NAME"
+  fi
+  if [[ "$DEPLOY_TUNNEL" == "yes" ]]; then
+    echo
+    echo "  Cloudflare Tunnel (DESIGN §6 tunnel mode):"
+    echo "    connector: cloudflared systemd unit inside the VM"
+    if [[ -n "${TUNNEL_HOSTNAME:-}" ]]; then
+      echo "    hostname:  https://$TUNNEL_HOSTNAME/"
+    fi
+    echo "    dashboard: https://dash.cloudflare.com/?to=/:account/tunnels"
+    echo "    Service URL must be: http://127.0.0.1:$UI_PORT"
+    echo "    re-run: limactl shell $VM_NAME -- sudo bash $RUN_DIR/start-tunnel.sh"
   fi
   echo
   cat <<EOF
@@ -721,6 +885,7 @@ main() {
   fill_warm_pool
   start_serve
   ensure_port_forward
+  ensure_cloudflare_tunnel
   smoke_workspace
   print_done
 }

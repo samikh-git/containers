@@ -20,10 +20,15 @@ services:
       - wsnet
       - default
     ports:
+      # 18443: host.docker.internal path for Docker Desktop sandboxes.
+      # (8443 is often taken by limactl port-forward to the dataplane VM.)
+      - "127.0.0.1:18443:8443"
       - "127.0.0.1:8444:8444"   # admin API — loopback only
     environment:
       - ANTHROPIC_API_KEY
+      - OPENROUTER_API_KEY
       - GATEWAY_ADMIN_TOKEN
+      - LOG_LEVEL
     volumes:
       - ./gateway.local.json:/etc/gateway/gateway.json:ro
       - gateway-audit:/var/lib/gateway

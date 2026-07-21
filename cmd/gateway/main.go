@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"containerization/gateway"
+	"containerization/internal/applog"
 )
 
 func main() {
@@ -21,7 +22,9 @@ func main() {
 	ledgerPath := flag.String("ledger", "audit.jsonl", "audit ledger file (JSONL, hash-chained)")
 	verify := flag.String("verify", "", "verify a ledger file's hash chain and exit")
 	admin := flag.String("admin", "127.0.0.1:8444", "admin API listen address (sessions register/revoke; keep on localhost)")
+	logLevel := flag.String("log-level", envOr("LOG_LEVEL", "info"), "log level: debug|info|warn|error")
 	flag.Parse()
+	applog.Configure(*logLevel)
 
 	if *verify != "" {
 		n, err := gateway.Verify(*verify)
@@ -76,4 +79,11 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
+}
+
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }

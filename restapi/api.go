@@ -30,6 +30,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -163,6 +164,7 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if s.Token != "" && r.Header.Get("Authorization") != "Bearer "+s.Token {
+			slog.Warn("api auth failed", "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)
 			httpError(w, http.StatusUnauthorized, "authorization required")
 			return
 		}
@@ -298,6 +300,7 @@ func (s *Server) fanout(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		// FanOut is not atomic: report what did come up alongside the error.
+		slog.Error("fanout failed", "workspace", id, "err", err, "branches_up", len(branches))
 		writeJSON(w, http.StatusInternalServerError,
 			map[string]any{"error": err.Error(), "branches": branches})
 		return
@@ -417,6 +420,7 @@ func (s *Server) opencode(w http.ResponseWriter, r *http.Request) {
 	}
 	endpoint, err := resolver.AgentEndpoint(r.Context(), id)
 	if err != nil {
+		slog.Error("opencode endpoint resolve failed", "workspace", id, "err", err)
 		httpError(w, http.StatusBadGateway, err.Error())
 		return
 	}
@@ -434,9 +438,12 @@ func (s *Server) opencode(w http.ResponseWriter, r *http.Request) {
 		},
 		FlushInterval: -1, // flush immediately: OpenCode's /event is SSE
 		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
+			slog.Error("opencode proxy failed",
+				"workspace", id, "endpoint", endpoint, "path", rest, "err", err)
 			httpError(w, http.StatusBadGateway, "opencode unreachable: "+err.Error())
 		},
 	}
+	slog.Debug("opencode proxy", "workspace", id, "endpoint", endpoint, "method", r.Method, "path", rest)
 	proxy.ServeHTTP(w, r)
 }
 
@@ -456,5 +463,10 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func httpError(w http.ResponseWriter, status int, msg string) {
+	if status >= 500 {
+		slog.Error("api error", "status", status, "error", msg)
+	} else if status >= 400 {
+		slog.Warn("api error", "status", status, "error", msg)
+	}
 	writeJSON(w, status, map[string]string{"error": msg})
 }

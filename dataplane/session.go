@@ -7,9 +7,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"time"
+
+	"containerization/internal/applog"
 )
 
 // Session tokens (DESIGN §9): the only credential a sandbox holds. Minted by
@@ -66,13 +70,26 @@ func (g *GatewayAdminClient) Register(ctx context.Context, token, workspace stri
 	g.auth(req)
 	resp, err := g.Client.Do(req)
 	if err != nil {
+		slog.Error("session register failed",
+			"workspace", workspace, "token", applog.TokenPrefix(token),
+			"admin", g.AdminURL, "err", err)
 		return fmt.Errorf("gateway admin: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("gateway admin: register returned %d", resp.StatusCode)
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		slog.Error("session register rejected",
+			"workspace", workspace, "token", applog.TokenPrefix(token),
+			"admin", g.AdminURL, "status", resp.StatusCode, "body", stringsTrim(msg))
+		return fmt.Errorf("gateway admin: register returned %d: %s", resp.StatusCode, stringsTrim(msg))
 	}
+	slog.Info("session registered",
+		"workspace", workspace, "token", applog.TokenPrefix(token), "routes", routes)
 	return nil
+}
+
+func stringsTrim(b []byte) string {
+	return string(bytes.TrimSpace(b))
 }
 
 // SetRouteKey sets or rotates a route's provider key at the gateway. The key
@@ -153,11 +170,17 @@ func (g *GatewayAdminClient) RevokeWorkspace(ctx context.Context, workspace stri
 	g.auth(req)
 	resp, err := g.Client.Do(req)
 	if err != nil {
+		slog.Error("session revoke failed", "workspace", workspace, "admin", g.AdminURL, "err", err)
 		return fmt.Errorf("gateway admin: %w", err)
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("gateway admin: revoke returned %d", resp.StatusCode)
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		slog.Error("session revoke rejected",
+			"workspace", workspace, "admin", g.AdminURL,
+			"status", resp.StatusCode, "body", stringsTrim(msg))
+		return fmt.Errorf("gateway admin: revoke returned %d: %s", resp.StatusCode, stringsTrim(msg))
 	}
+	slog.Info("session revoked", "workspace", workspace)
 	return nil
 }

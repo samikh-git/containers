@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"containerization/dataplane"
+	"containerization/internal/applog"
 	"containerization/restapi"
 )
 
@@ -68,10 +69,12 @@ func main() {
 		listen    = fs.String("listen", "127.0.0.1:8400", "serve: REST API listen address")
 		activity  = fs.String("activity", "", "terminal activity JSONL — serve appends, watch reads (default <root>/terminal-activity.jsonl)")
 		poolN     = fs.Int("pool-n", 2, "pool fill / serve auto-refill: target ready warm slots (0 disables serve auto-refill)")
+		logLevel  = fs.String("log-level", envOr("LOG_LEVEL", "info"), "log level: debug|info|warn|error")
 	)
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)
 	}
+	applog.Configure(*logLevel)
 	if *activity == "" {
 		*activity = filepath.Join(*root, "terminal-activity.jsonl")
 	}
@@ -327,6 +330,13 @@ func exitOn(err error) {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
+}
+
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }
 
 func usage() {
