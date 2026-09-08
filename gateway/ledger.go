@@ -6,6 +6,7 @@ package gateway
 
 import (
 	"bytes"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -39,21 +40,40 @@ type Event struct {
 
 // Ledger is an append-only, hash-chained JSONL file. Local mode writes it to
 // disk; team/enterprise mode ships the same lines to the org's SIEM (§11).
+//
+// On tamper-evidence, precisely: an unkeyed SHA-256 chain detects truncation
+// and accidental corruption, but not a motivated editor — anyone who can
+// write the file can rewrite history and recompute every hash, and Verify
+// would report the chain intact. Setting a key (GATEWAY_LEDGER_KEY) switches
+// the chain to HMAC-SHA256, so forging it requires the key and not merely
+// write access to the file. Keep the key somewhere the ledger's writer is
+// not, or it is only a speed bump.
 type Ledger struct {
 	mu   sync.Mutex
 	f    *os.File
+	key  []byte
 	seq  uint64
 	prev string
 }
 
+// LedgerKeyEnv names the environment variable holding the chain key.
+const LedgerKeyEnv = "GATEWAY_LEDGER_KEY"
+
 // OpenLedger opens (or creates) the ledger file and, if it has prior
-// entries, resumes the chain from the last one.
+// entries, resumes the chain from the last one. The chain is keyed when
+// GATEWAY_LEDGER_KEY is set.
 func OpenLedger(path string) (*Ledger, error) {
+	return OpenLedgerWithKey(path, []byte(os.Getenv(LedgerKeyEnv)))
+}
+
+// OpenLedgerWithKey is OpenLedger with an explicit chain key ("" for the
+// unkeyed, corruption-evident-only chain).
+func OpenLedgerWithKey(path string, key []byte) (*Ledger, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, err
 	}
-	l := &Ledger{f: f}
+	l := &Ledger{f: f, key: key}
 
 	// Resume chain state from existing content.
 	events, err := ReadEvents(path)
@@ -83,7 +103,7 @@ func (l *Ledger) Append(e Event) error {
 		e.Time = time.Now().UTC()
 	}
 	e.Hash = ""
-	h, err := hashEvent(e)
+	h, err := hashEvent(e, l.key)
 	if err != nil {
 		return err
 	}
@@ -102,7 +122,14 @@ func (l *Ledger) Append(e Event) error {
 
 // Verify replays a ledger file and checks the chain: sequence continuity,
 // prev-linkage, and every event's hash. Returns the number of valid events.
+// Uses GATEWAY_LEDGER_KEY when set — verifying a keyed chain without the key
+// (or an unkeyed one with it) fails at the first event, as it should.
 func Verify(path string) (int, error) {
+	return VerifyWithKey(path, []byte(os.Getenv(LedgerKeyEnv)))
+}
+
+// VerifyWithKey is Verify with an explicit chain key.
+func VerifyWithKey(path string, key []byte) (int, error) {
 	events, err := ReadEvents(path)
 	if err != nil {
 		return 0, err
@@ -117,22 +144,30 @@ func Verify(path string) (int, error) {
 		}
 		want := e.Hash
 		e.Hash = ""
-		got, err := hashEvent(e)
+		got, err := hashEvent(e, key)
 		if err != nil {
 			return i, err
 		}
 		if got != want {
-			return i, fmt.Errorf("event %d: hash mismatch — ledger tampered or corrupt", i)
+			return i, fmt.Errorf("event %d: hash mismatch — ledger corrupt, edited, or sealed with a different %s", i, LedgerKeyEnv)
 		}
 		prev = want
 	}
 	return len(events), nil
 }
 
-func hashEvent(e Event) (string, error) {
+// hashEvent seals an event. With a key the chain is an HMAC chain, which
+// cannot be recomputed by someone who only has the file; without one it is a
+// plain digest, which can.
+func hashEvent(e Event, key []byte) (string, error) {
 	b, err := json.Marshal(e) // Hash field must be "" when called
 	if err != nil {
 		return "", err
+	}
+	if len(key) > 0 {
+		mac := hmac.New(sha256.New, key)
+		mac.Write(b)
+		return hex.EncodeToString(mac.Sum(nil)), nil
 	}
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:]), nil

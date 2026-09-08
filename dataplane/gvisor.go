@@ -532,7 +532,8 @@ func (g *GVisorRuntime) RestoreWorkspace(ctx context.Context, spec WorkspaceSpec
 
 // CheckpointWorkspace checkpoints a running sandbox to imageDir and tears
 // the (now stopped) sandbox down, keeping the workspace volume. Used by the
-// warm pool to turn a booted golden sandbox into slot inventory.
+// warm pool to turn a booted golden sandbox into slot inventory, and by
+// process hibernate (same machinery, image kept under StateDir/hibernate).
 func (g *GVisorRuntime) CheckpointWorkspace(ctx context.Context, wsID, imageDir string) error {
 	name := containerName(wsID)
 	st, err := g.readState(name)
@@ -548,6 +549,63 @@ func (g *GVisorRuntime) CheckpointWorkspace(ctx context.Context, wsID, imageDir 
 	// checkpoint leaves the container stopped; remove it and its netns.
 	g.cleanup(ctx, st)
 	return nil
+}
+
+type hibernateMeta struct {
+	Token     string    `json:"token"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+func (g *GVisorRuntime) hibernateRoot(wsID string) string {
+	return filepath.Join(g.StateDir, "hibernate", wsID)
+}
+
+// HibernateCheckpoint implements ProcessHibernator: runsc checkpoint into
+// StateDir (outside the /workspace bind) and record the frozen session
+// token for resume. meta.json is written last so a crash mid-checkpoint
+// never yields a half-usable image.
+func (g *GVisorRuntime) HibernateCheckpoint(ctx context.Context, wsID, token string) error {
+	root := g.hibernateRoot(wsID)
+	_ = os.RemoveAll(root)
+	ckpt := filepath.Join(root, "ckpt")
+	if err := g.CheckpointWorkspace(ctx, wsID, ckpt); err != nil {
+		_ = os.RemoveAll(root)
+		return err
+	}
+	meta := hibernateMeta{Token: token, CreatedAt: time.Now().UTC()}
+	b, err := json.MarshalIndent(meta, "", " ")
+	if err != nil {
+		_ = os.RemoveAll(root)
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(root, "meta.json"), b, 0o600); err != nil {
+		_ = os.RemoveAll(root)
+		return err
+	}
+	return nil
+}
+
+// HibernateImage implements ProcessHibernator.
+func (g *GVisorRuntime) HibernateImage(wsID string) (imageDir, token string, ok bool) {
+	root := g.hibernateRoot(wsID)
+	b, err := os.ReadFile(filepath.Join(root, "meta.json"))
+	if err != nil {
+		return "", "", false
+	}
+	var meta hibernateMeta
+	if json.Unmarshal(b, &meta) != nil || meta.Token == "" {
+		return "", "", false
+	}
+	ckpt := filepath.Join(root, "ckpt")
+	if st, err := os.Stat(ckpt); err != nil || !st.IsDir() {
+		return "", "", false
+	}
+	return ckpt, meta.Token, true
+}
+
+// ClearHibernate implements ProcessHibernator.
+func (g *GVisorRuntime) ClearHibernate(wsID string) error {
+	return os.RemoveAll(g.hibernateRoot(wsID))
 }
 
 // AgentListening reports whether the agent has bound its port, checked from

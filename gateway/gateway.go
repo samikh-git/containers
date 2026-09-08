@@ -25,6 +25,56 @@ type Route struct {
 	KeyEnv        string   `json:"key_env"`  // env var holding the provider key (host side only)
 	AllowedModels []string `json:"allowed_models,omitempty"`
 	MaxRequestMB  int64    `json:"max_request_mb,omitempty"` // default 20
+	// AllowedPaths bounds which upstream endpoints a session may reach.
+	// Trailing "*" wildcards, same syntax as AllowedModels. Empty means the
+	// kind's default set (defaultPaths) — inference only. This matters
+	// because the gateway attaches the ORGANIZATION's provider key: without
+	// it, a sandbox token is also a key for the provider's account
+	// management, batch and file APIs, which is a much bigger grant than
+	// "this workspace may talk to a model".
+	AllowedPaths []string `json:"allowed_paths,omitempty"`
+	// MaxRequestsPerMinute caps how fast one workspace may spend against
+	// this route. 0 uses defaultRPM; a negative value disables the cap.
+	// Spend is the real exposure of a leaked session token, and a cap is
+	// the difference between a bounded incident and an unbounded bill.
+	MaxRequestsPerMinute int `json:"max_requests_per_minute,omitempty"`
+}
+
+// defaultRPM is the per-workspace, per-route request ceiling when a route
+// does not set one. High enough that an agent doing real work never notices,
+// low enough that a stolen token cannot drain an account overnight.
+const defaultRPM = 120
+
+// defaultPaths are the inference endpoints of both conventions. Kind is not
+// the discriminator here: it selects the auth header, not the API surface,
+// and an OpenAI-kind upstream like OpenRouter serves the Anthropic-shaped
+// /v1/messages too. What this list excludes is the point — account
+// administration, batches, files, anything that spends or reveals beyond a
+// single completion. A route that legitimately fronts more says so with
+// allowed_paths.
+var defaultPaths = []string{
+	"/v1/messages", "/v1/messages/*",
+	"/v1/chat/completions", "/v1/completions", "/v1/responses",
+	"/v1/embeddings", "/v1/complete",
+	"/v1/models", "/v1/models/*",
+}
+
+// pathAllowed vets the request path against the route's allowlist.
+func (r Route) pathAllowed(p string) bool {
+	allowed := r.AllowedPaths
+	if len(allowed) == 0 {
+		allowed = defaultPaths
+	}
+	for _, a := range allowed {
+		if prefix, ok := strings.CutSuffix(a, "*"); ok {
+			if strings.HasPrefix(p, prefix) {
+				return true
+			}
+		} else if a == p {
+			return true
+		}
+	}
+	return false
 }
 
 // Session maps a sandbox-held token to a workspace and the routes it may use.
@@ -131,6 +181,7 @@ type Server struct {
 	mu       sync.RWMutex
 	sessions map[string]Session // seeded from Config, mutated via AdminHandler
 	keys     map[string]string  // route -> provider key set at runtime (admin API)
+	limiter  *rateLimiter
 }
 
 func NewServer(cfg *Config, ledger *Ledger) *Server {
@@ -144,6 +195,7 @@ func NewServer(cfg *Config, ledger *Ledger) *Server {
 		Client:   &http.Client{Timeout: 10 * time.Minute}, // model streams are long
 		sessions: sessions,
 		keys:     make(map[string]string),
+		limiter:  newRateLimiter(),
 	}
 }
 
@@ -352,6 +404,30 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	ev.Route, ev.Upstream = routeName, route.BaseURL
 
+	// Which endpoint, not just which model. The provider key we are about to
+	// attach is the organization's, and it opens far more than inference.
+	upPath := path.Clean("/" + r.URL.Path)
+	if !route.pathAllowed(upPath) {
+		ev.Outcome, ev.Reason, ev.Status = "blocked", "path not allowed on this route", http.StatusForbidden
+		s.record(ev)
+		slog.Warn("gateway blocked request",
+			"workspace", sess.Workspace, "route", routeName, "path", upPath,
+			"reason", ev.Reason, "status", ev.Status)
+		http.Error(w, fmt.Sprintf("path %q not allowed on this route", upPath), http.StatusForbidden)
+		return
+	}
+
+	// Spend ceiling per workspace and route.
+	if !s.limiter.allow(sess.Workspace+"\x00"+routeName, rpmOf(route), time.Now()) {
+		ev.Outcome, ev.Reason, ev.Status = "blocked", "rate limit exceeded", http.StatusTooManyRequests
+		s.record(ev)
+		slog.Warn("gateway rate limited",
+			"workspace", sess.Workspace, "route", routeName, "limit_rpm", rpmOf(route))
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, "rate limit exceeded for this workspace", http.StatusTooManyRequests)
+		return
+	}
+
 	// Size cap is the selected route's policy, so exceeding it is an event.
 	maxBytes := route.MaxRequestMB
 	if maxBytes <= 0 {
@@ -381,7 +457,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Forward: same path, upstream base, provider key swapped in.
 	up, err := http.NewRequestWithContext(r.Context(), r.Method,
-		strings.TrimRight(route.BaseURL, "/")+path.Clean("/"+r.URL.Path), strings.NewReader(string(body)))
+		strings.TrimRight(route.BaseURL, "/")+upPath, strings.NewReader(string(body)))
 	if err != nil {
 		slog.Error("gateway bad upstream request", "workspace", sess.Workspace, "route", routeName, "err", err)
 		http.Error(w, "bad upstream request", http.StatusInternalServerError)
@@ -417,7 +493,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Stream through, counting bytes and flushing (SSE-friendly). Token
 	// counts are parsed best-effort from the two wire formats we own (§9).
+	// Headers are copied minus the hop-by-hop set and minus anything that
+	// would let an upstream plant state in the sandbox (cookies) — the
+	// gateway is a policy door, not a transparent pipe.
 	for k, vs := range resp.Header {
+		if skipResponseHeader(k) {
+			continue
+		}
 		for _, v := range vs {
 			w.Header().Add(k, v)
 		}
@@ -447,6 +529,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	} else {
 		slog.Info("gateway forwarded", attrs...)
 	}
+}
+
+// rpmOf resolves a route's request ceiling: 0 means "use the default", and a
+// negative value is an explicit opt-out.
+func rpmOf(r Route) int {
+	if r.MaxRequestsPerMinute == 0 {
+		return defaultRPM
+	}
+	return r.MaxRequestsPerMinute
 }
 
 func (s *Server) sessionCount() int {
@@ -496,6 +587,20 @@ func modelAllowed(allowed []string, model string) bool {
 		}
 	}
 	return false
+}
+
+// hopByHopHeaders are per-connection headers that must not be relayed
+// (RFC 9110 §7.6.1); Set-Cookie is here because nothing in a model response
+// has any business setting state in the sandbox.
+var hopByHopHeaders = map[string]bool{
+	"Connection": true, "Keep-Alive": true, "Proxy-Authenticate": true,
+	"Proxy-Authorization": true, "Te": true, "Trailer": true,
+	"Transfer-Encoding": true, "Upgrade": true,
+	"Set-Cookie": true,
+}
+
+func skipResponseHeader(k string) bool {
+	return hopByHopHeaders[http.CanonicalHeaderKey(k)]
 }
 
 // copyProxyHeaders forwards content/accept headers but never the sandbox's

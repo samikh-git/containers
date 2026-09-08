@@ -248,9 +248,9 @@ limactl shell dataplane -- sudo GATEWAY_ADMIN_TOKEN=... ~/Developer/containeriza
   --profile ~/Developer/containerization/examples/profile \
   --image opencode-sandbox:v1
 
-# serve keeps the pool topped up after each claim (target = --pool-n, default 2;
-# --pool-n 0 disables). Background fill starts immediately on serve.
-… router serve --runtime gvisor --pool-n 2 …
+# serve keeps the pool topped up after each claim (target = --pool-n, default 4;
+# --pool-n 0 disables). Background fill starts immediately on serve (up to 2 parallel).
+… router serve --runtime gvisor --pool-n 4 …
 
 # inventory / teardown
 … router pool status …

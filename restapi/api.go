@@ -90,8 +90,16 @@ type Server struct {
 	// as they'd default for the CLI.
 	Defaults dataplane.WorkspaceSpec
 	// Token, when set, is required as "Authorization: Bearer <Token>" on
-	// every /api request. MANDATORY when the listener is not loopback-bound.
+	// every /api request. MANDATORY when the listener is not loopback-bound,
+	// and when the listener is published off-box by a tunnel (a loopback bind
+	// is not a trust boundary once something forwards traffic to it).
 	Token string
+	// AllowedHosts are the non-loopback names this server may be addressed
+	// by — the tunnel hostname, a reverse proxy's name. Loopback is always
+	// allowed. Anything else is refused: an unrecognized Host means either a
+	// DNS-rebinding attack or a misrouted request, and both should fail.
+	// Origin is vetted against the same set (guard.go).
+	AllowedHosts []string
 	// TerminalActivity records web-terminal input for the idle monitor's
 	// fourth condition (terminal.go); nil disables recording.
 	TerminalActivity *dataplane.TerminalActivityLog
@@ -105,13 +113,13 @@ type Server struct {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/workspaces", s.auth(s.list))
-	mux.HandleFunc("POST /api/workspaces", s.auth(s.up))
-	mux.HandleFunc("POST /api/workspaces/{id}/fanout", s.auth(s.fanout))
+	mux.HandleFunc("POST /api/workspaces", s.authJSON(s.up))
+	mux.HandleFunc("POST /api/workspaces/{id}/fanout", s.authJSON(s.fanout))
 	mux.HandleFunc("POST /api/workspaces/{id}/down", s.auth(s.down))
 	mux.HandleFunc("POST /api/workspaces/{id}/hibernate", s.auth(s.hibernate))
 	mux.HandleFunc("DELETE /api/workspaces/{id}", s.auth(s.destroy))
 	mux.HandleFunc("GET /api/keys", s.auth(s.keyStatus))
-	mux.HandleFunc("PUT /api/keys/{route}", s.auth(s.setKey))
+	mux.HandleFunc("PUT /api/keys/{route}", s.authJSON(s.setKey))
 	mux.HandleFunc("GET /api/routes", s.auth(s.routes))
 	mux.HandleFunc("GET /api/defaults", s.auth(s.defaults))
 	mux.HandleFunc("GET /api/usage", s.auth(s.usage))
@@ -161,15 +169,34 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
+// auth gates a handler on the bearer token and on the request's provenance.
+// The provenance checks run even when no token is configured — that is
+// exactly the case where a hostile page would otherwise be able to drive the
+// API with the operator's own browser.
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.Token != "" && r.Header.Get("Authorization") != "Bearer "+s.Token {
+		if !s.guard(w, r) {
+			return
+		}
+		if s.Token != "" && !bearerEqual(r.Header.Get("Authorization"), s.Token) {
 			slog.Warn("api auth failed", "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)
 			httpError(w, http.StatusUnauthorized, "authorization required")
 			return
 		}
 		next(w, r)
 	}
+}
+
+// authJSON is auth plus a Content-Type check, for the handlers that decode a
+// request body. Kept separate from auth so the OpenCode reverse proxy and the
+// bodyless lifecycle POSTs are not forced into a shape they never had.
+func (s *Server) authJSON(next http.HandlerFunc) http.HandlerFunc {
+	return s.auth(func(w http.ResponseWriter, r *http.Request) {
+		if !requireJSON(w, r) {
+			return
+		}
+		next(w, r)
+	})
 }
 
 // specRequest is the JSON shape of a provision/fanout request. Zero-valued

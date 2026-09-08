@@ -6,13 +6,15 @@
       "base_url": "https://api.anthropic.com",
       "key_env": "ANTHROPIC_API_KEY",
       "allowed_models": ["claude-*", "anthropic/*"],
-      "max_request_mb": 20
+      "max_request_mb": 20,
+      "max_requests_per_minute": 120
     },
     "tier-b-openrouter": {
       "kind": "openai",
       "base_url": "https://openrouter.ai/api",
       "key_env": "OPENROUTER_API_KEY",
-      "max_request_mb": 20
+      "max_request_mb": 20,
+      "max_requests_per_minute": 120
     }
   },
   "sessions": {}

@@ -3,3 +3,9 @@
 gateway.local.json
 dataplane-vm/bin/
 dataplane-vm/run/
+.claude/
+.cursor/
+design-docs/
+audit.jsonl
+/gw
+/router

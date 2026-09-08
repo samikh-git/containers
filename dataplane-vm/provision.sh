@@ -51,10 +51,13 @@ echo "== CNI (for --runtime containerd) =="
 # The direct-containerd runtime (PERFORMANCE.md item 2) does its own
 # networking via CNI: a named --network is /etc/cni/net.d/<name>.conflist.
 # "wsnet" below is an ISOLATED bridge — no default route, no masquerade, so
-# sandboxes get no egress (DESIGN §8); they reach only each other and the
-# host side of the bridge (10.88.0.1), which is where the gateway listens on
-# this path. The Docker runtimes keep using Docker networks; this file is
-# only read by --runtime containerd|containerd-runc.
+# sandboxes get no egress (DESIGN §8). They reach the host side of the bridge
+# (10.88.0.1), which is where the gateway listens on this path, and NOTHING
+# ELSE: the FORWARD rules installed below drop sandbox-to-sandbox traffic.
+# Without them every workspace could dial its neighbours' agent and terminal
+# ports, which is one compromised agent away from being every workspace's
+# problem. The Docker runtimes keep using Docker networks; this file is only
+# read by --runtime containerd|containerd-runc.
 apt-get install -y containernetworking-plugins   # -> /usr/lib/cni
 mkdir -p /etc/cni/net.d
 cat > /etc/cni/net.d/wsnet.conflist <<'EOF'
@@ -75,6 +78,38 @@ cat > /etc/cni/net.d/wsnet.conflist <<'EOF'
   ]
 }
 EOF
+
+# Peer isolation for the CNI bridge. Traffic from a sandbox to the host
+# (10.88.0.1 — the gateway) is INPUT, not FORWARD, so the gateway stays
+# reachable; traffic from one sandbox to another crosses the bridge as
+# FORWARD and is dropped here. Installed as a unit so it survives reboots,
+# and idempotent so re-provisioning does not stack duplicate rules.
+apt-get install -y iptables
+cat > /usr/local/sbin/wsnet-isolate <<'EOF'
+#!/bin/sh
+# Drop sandbox-to-sandbox traffic on the workspace bridge (DESIGN §8:
+# workspaces are isolated from each other, not just from the internet).
+set -e
+while iptables -D FORWARD -i cni-wsnet -o cni-wsnet -j DROP 2>/dev/null; do :; done
+iptables -I FORWARD 1 -i cni-wsnet -o cni-wsnet -j DROP
+EOF
+chmod +x /usr/local/sbin/wsnet-isolate
+cat > /etc/systemd/system/wsnet-isolate.service <<'EOF'
+[Unit]
+Description=Isolate workspace sandboxes from each other on the CNI bridge
+After=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/wsnet-isolate
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable --now wsnet-isolate.service
 
 echo "== ZFS pool =="
 POOL_DEV="${POOL_DEV:-}"

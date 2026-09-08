@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"containerization/dataplane"
@@ -67,8 +68,9 @@ func main() {
 		interval  = fs.Duration("interval", 30*time.Second, "watch: probe interval")
 		ledger    = fs.String("ledger", "", "gateway audit ledger path — watch: model-traffic activity; serve: LastActivityAt + /api/usage cost metrics")
 		listen    = fs.String("listen", "127.0.0.1:8400", "serve: REST API listen address")
+		allowHost = fs.String("allowed-host", envOr("ROUTER_ALLOWED_HOSTS", ""), "serve: comma-separated extra Host/Origin names to accept (tunnel or proxy hostname; loopback is always accepted)")
 		activity  = fs.String("activity", "", "terminal activity JSONL — serve appends, watch reads (default <root>/terminal-activity.jsonl)")
-		poolN     = fs.Int("pool-n", 2, "pool fill / serve auto-refill: target ready warm slots (0 disables serve auto-refill)")
+		poolN     = fs.Int("pool-n", 4, "pool fill / serve auto-refill: target ready warm slots (0 disables serve auto-refill; fill builds up to 2 in parallel)")
 		logLevel  = fs.String("log-level", envOr("LOG_LEVEL", "info"), "log level: debug|info|warn|error")
 	)
 	if err := fs.Parse(args); err != nil {
@@ -80,9 +82,10 @@ func main() {
 	}
 
 	router := &dataplane.Router{
-		Storage: buildStorage(*storage, *pool, *root),
-		Leases:  &dataplane.FileLeaseAuthority{Path: filepath.Join(*root, "leases.json")},
-		Runtime: buildRuntime(*rt, *root),
+		Storage:  buildStorage(*storage, *pool, *root),
+		Leases:   &dataplane.FileLeaseAuthority{Path: filepath.Join(*root, "leases.json")},
+		Runtime:  buildRuntime(*rt, *root),
+		Terminal: &dataplane.TerminalKey{Path: filepath.Join(*root, "terminal.key")},
 	}
 	if *gateway != "" {
 		router.Sessions = dataplane.NewGatewayAdminClient(*gwAdmin, os.Getenv("GATEWAY_ADMIN_TOKEN"))
@@ -222,6 +225,7 @@ func main() {
 				Route: *route, Network: *network,
 			},
 			Token:            os.Getenv("ROUTER_API_TOKEN"),
+			AllowedHosts:     splitList(*allowHost),
 			TerminalActivity: &dataplane.TerminalActivityLog{Path: *activity},
 			LedgerPath:       *ledger,
 		}
@@ -232,8 +236,22 @@ func main() {
 			fmt.Fprintln(os.Stderr, "refusing to serve on a non-loopback address without ROUTER_API_TOKEN")
 			os.Exit(2)
 		}
+		// A loopback bind is not a trust boundary when something forwards
+		// public traffic to it: naming an external host is exactly that
+		// declaration, so the token stops being optional.
+		if srv.Token == "" && len(srv.AllowedHosts) > 0 {
+			fmt.Fprintln(os.Stderr,
+				"refusing to serve with --allowed-host set but no ROUTER_API_TOKEN:\n"+
+					"an external name means the API is reachable off-box, so it must require a token")
+			os.Exit(2)
+		}
 		fmt.Printf("REST API and web UI on http://%s\n", *listen)
-		exitOn(http.ListenAndServe(*listen, srv.Handler()))
+		api := &http.Server{
+			Addr:              *listen,
+			Handler:           srv.Handler(),
+			ReadHeaderTimeout: 20 * time.Second,
+		}
+		exitOn(api.ListenAndServe())
 
 	default:
 		usage()
@@ -330,6 +348,17 @@ func exitOn(err error) {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
+}
+
+// splitList parses a comma-separated flag into a trimmed, non-empty list.
+func splitList(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func envOr(key, fallback string) string {

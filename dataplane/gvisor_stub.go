@@ -36,6 +36,11 @@ func (g *GVisorRuntime) RestoreWorkspace(context.Context, WorkspaceSpec, string,
 func (g *GVisorRuntime) CheckpointWorkspace(context.Context, string, string) error {
 	return errGVisorLinuxOnly
 }
+func (g *GVisorRuntime) HibernateCheckpoint(context.Context, string, string) error {
+	return errGVisorLinuxOnly
+}
+func (g *GVisorRuntime) HibernateImage(string) (string, string, bool) { return "", "", false }
+func (g *GVisorRuntime) ClearHibernate(string) error                  { return nil }
 func (g *GVisorRuntime) AgentListening(context.Context, string) bool { return false }
 func (g *GVisorRuntime) AgentReady(context.Context, string) bool     { return false }
 func (g *GVisorRuntime) AgentEndpoint(context.Context, string) (string, error) {

@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -30,8 +31,20 @@ type AdminHandler struct {
 	Token string
 }
 
+// authorized checks the admin bearer token in constant time. The admin port
+// is reachable from the sandbox network by design (the sandboxes' own
+// gateway container publishes it), so this comparison is exposed to callers
+// who can measure it — and the token it protects can mint sessions.
+func (a *AdminHandler) authorized(r *http.Request) bool {
+	if a.Token == "" {
+		return true
+	}
+	tok, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	return ok && subtle.ConstantTimeCompare([]byte(tok), []byte(a.Token)) == 1
+}
+
 func (a *AdminHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if a.Token != "" && r.Header.Get("Authorization") != "Bearer "+a.Token {
+	if !a.authorized(r) {
 		slog.Warn("gateway admin auth failed", "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)
 		http.Error(w, "admin authorization required", http.StatusUnauthorized)
 		return

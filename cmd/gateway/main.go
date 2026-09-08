@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"containerization/gateway"
 	"containerization/internal/applog"
@@ -67,7 +68,12 @@ func main() {
 	}
 	go func() {
 		fmt.Printf("admin API on %s\n", *admin)
-		if err := http.ListenAndServe(*admin, &gateway.AdminHandler{Server: srv, Token: adminToken}); err != nil {
+		adminSrv := &http.Server{
+			Addr:              *admin,
+			Handler:           &gateway.AdminHandler{Server: srv, Token: adminToken},
+			ReadHeaderTimeout: 20 * time.Second,
+		}
+		if err := adminSrv.ListenAndServe(); err != nil {
 			fmt.Fprintln(os.Stderr, "admin listener error:", err)
 			os.Exit(1)
 		}
@@ -75,7 +81,11 @@ func main() {
 
 	fmt.Printf("policy gateway listening on %s (%d routes, %d seed sessions), ledger at %s\n",
 		listen, len(cfg.Routes), len(cfg.Sessions), *ledgerPath)
-	if err := http.ListenAndServe(listen, srv); err != nil {
+	// ReadHeaderTimeout, not ReadTimeout: this listener faces the sandboxes,
+	// so a stalled handshake must not pin a connection, but a long streaming
+	// completion must not be cut off either.
+	gw := &http.Server{Addr: listen, Handler: srv, ReadHeaderTimeout: 20 * time.Second}
+	if err := gw.ListenAndServe(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}

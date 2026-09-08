@@ -41,6 +41,9 @@ func do(t *testing.T, method, url, body, token string) (*http.Response, map[stri
 	if err != nil {
 		t.Fatal(err)
 	}
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}

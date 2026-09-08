@@ -14,12 +14,14 @@
 package main
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -35,13 +37,46 @@ const (
 	closeStopping    = 4002
 )
 
-// The router is the only peer that can reach this port (sandbox netns / veth,
-// §8), so cross-origin checks would only ever see the router's forwarded
-// request. Accept all origins and let the router's auth be the gate.
+// Origin checks would only ever see the router's forwarded request, so they
+// say nothing here; authorization is the token check in serveTerm instead.
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
 	CheckOrigin:     func(*http.Request) bool { return true },
+}
+
+// tokenPath is where the router installs this workspace's terminal
+// credential (dataplane.TerminalTokenFile). Read per connection rather than
+// cached at startup: the router rewrites it when a workspace is restored or
+// cloned, and a stale token in memory would lock the operator out of their
+// own terminal.
+const tokenPath = "/workspace/.agent-state/terminal.token"
+
+// authorized reports whether a request carries this workspace's terminal
+// token. Peer sandboxes share a network with this one and can open the port
+// (DESIGN §8's isolation is not per-workspace on either runtime path), so
+// reaching the listener must not be the same thing as being allowed a shell.
+//
+// Fail closed: no token file means no terminal. A sandbox whose router never
+// installed one is a sandbox nobody can prove they own.
+func authorized(r *http.Request) bool {
+	want, err := os.ReadFile(tokenPath)
+	if err != nil {
+		log.Printf("terminal denied: no token file at %s: %v", tokenPath, err)
+		return false
+	}
+	expected := strings.TrimSpace(string(want))
+	if expected == "" {
+		log.Printf("terminal denied: empty token file")
+		return false
+	}
+	presented := r.URL.Query().Get("token")
+	if h := r.Header.Get("Authorization"); h != "" {
+		if t, ok := strings.CutPrefix(h, "Bearer "); ok {
+			presented = t
+		}
+	}
+	return subtle.ConstantTimeCompare([]byte(presented), []byte(expected)) == 1
 }
 
 type resizeMsg struct {
@@ -85,6 +120,10 @@ func main() {
 }
 
 func serveTerm(w http.ResponseWriter, r *http.Request) {
+	if !authorized(r) {
+		http.Error(w, "terminal token required", http.StatusUnauthorized)
+		return
+	}
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return // Upgrade already replied with an error

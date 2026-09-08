@@ -1,9 +1,7 @@
 # Sovereign AI Developer Workspace Platform
 
 Governed execution layer for AI coding agents: sandboxed, disposable compute
-over snapshotted storage, on hardware you own. See [DESIGN.md](DESIGN.md)
-(architecture), [COMPETITIVE.md](COMPETITIVE.md) (market),
-[GTM.md](GTM.md) (pitch & pricing).
+over snapshotted storage, on hardware you own.
 
 ## Layout
 
@@ -40,8 +38,10 @@ hibernate) lives at `/admin` (React + [Kumo](https://kumo-ui.com); rebuild
 with `npm run build` in `frontend/`). The API is plain JSON for scripting:
 
 ```sh
-curl -X POST localhost:8400/api/workspaces -d '{"id":"ws1"}'
-curl -X POST localhost:8400/api/workspaces/ws1/fanout -d '{"n":5}'
+curl -X POST -H 'Content-Type: application/json' \
+  localhost:8400/api/workspaces -d '{"id":"ws1"}'
+curl -X POST -H 'Content-Type: application/json' \
+  localhost:8400/api/workspaces/ws1/fanout -d '{"n":5}'
 curl        localhost:8400/api/workspaces
 curl        localhost:8400/api/usage?window=24h   # requires --ledger
 curl -X POST localhost:8400/api/workspaces/ws1/down
@@ -53,6 +53,32 @@ profile_dir, gateway_url, route, network) default to the `serve` command's
 flags. Non-loopback listeners require `ROUTER_API_TOKEN` (sent as
 `Authorization: Bearer …`); DESIGN §4's signed session tokens replace this
 in team mode.
+
+### What guards the API
+
+The control surface creates and destroys workspaces, reads and writes
+workspace files, rotates provider keys, and opens a root shell in any
+sandbox. Four things stand in front of it:
+
+- **`ROUTER_API_TOKEN`** — required on every `/api` request when set, and
+  mandatory for a non-loopback listener or whenever `--allowed-host` names an
+  external name. The browser UI picks it up from a `#token=…` fragment once
+  and keeps it in `localStorage`.
+- **Host allowlist** — the API answers to loopback and to names given with
+  `--allowed-host` (comma-separated, or `ROUTER_ALLOWED_HOSTS`). Anything
+  else gets a 421, which is what stops a DNS-rebinding page from reaching a
+  loopback listener.
+- **Origin check** — a request carrying an `Origin` the host allowlist would
+  reject is refused, including on the terminal's WebSocket upgrade. A
+  WebSocket upgrade is exempt from the same-origin policy and never
+  preflights, so without this any page the operator visited could open a
+  shell in every sandbox.
+- **`Content-Type: application/json`** — required on request bodies, so the
+  no-preflight "simple request" CSRF shapes cannot reach a mutating handler.
+
+**A loopback bind is not a security boundary.** Anything that forwards to it
+— a tunnel, an SSH forward, another user on the host — makes the API as
+reachable as whatever does the forwarding. Set the token.
 
 ### Talking to the agent & managing provider keys
 
@@ -103,8 +129,24 @@ ANTHROPIC_API_KEY=sk-ant-… ./gw --config gateway.json --ledger audit.jsonl
 
 Provider keys live in the gateway process only. Sandboxes hold per-workspace
 session tokens (sent as `x-api-key` or `Bearer`); the gateway swaps them for
-the real key, enforces model allowlists, size caps and secret tripwires, and
-appends every request — allowed or blocked — to the hash-chained ledger.
+the real key and appends every request — allowed or blocked — to the
+hash-chained ledger. What a session token buys is deliberately narrow:
+
+- **Models** — the route's `allowed_models`.
+- **Endpoints** — `allowed_paths`, defaulting to the inference endpoints of
+  both wire conventions. The key being attached is the organization's, and
+  it also opens account administration, batches and files; a workspace has
+  no business reaching those.
+- **Rate** — `max_requests_per_minute` per workspace and route (default 120,
+  negative disables). Spend is the real exposure of a leaked token, and
+  revocation needs someone to notice first.
+- Plus the size cap and the outbound secret tripwires.
+
+`GATEWAY_LEDGER_KEY`, when set, seals the ledger chain with HMAC-SHA256
+instead of a bare digest. Without it the chain catches truncation and
+corruption but not an editor: anyone who can write the file can recompute
+every hash and `--verify` will still say the chain is intact. Keep the key
+somewhere the gateway's ledger writer is not.
 
 Sessions are dynamic: the router mints a token per workspace at `up`/`fanout`,
 registers it via the gateway's admin API (`--admin`, default 127.0.0.1:8444;
@@ -169,22 +211,23 @@ otherwise.
 ### Warm pool (fast fresh starts)
 
 Pre-boot and checkpoint sandboxes off the critical path, then restore onto
-a new workspace (~4× faster end-to-end than cold boot; see
-[PERFORMANCE.md](PERFORMANCE.md)):
+a new workspace (~4× faster end-to-end than cold boot):
 
 ```sh
 ./router pool fill --pool-n 3 --storage zfs --pool tank --runtime gvisor \
   --network wsnet --gateway http://gateway:8443 --route tier-a-anthropic \
   --profile /etc/profiles/org-default --image opencode-sandbox:v1
 
-./router serve --storage zfs --pool tank --runtime gvisor --pool-n 2 …  # auto-refills after each claim
+./router serve --storage zfs --pool tank --runtime gvisor --pool-n 4 …  # auto-refills after each claim
 ./router pool status
 ./router pool drain
 ```
 
-Warm restore applies only to workspaces that do not exist yet (resume must
-cold-boot). `serve --pool-n N` (default 2; `0` disables) keeps inventory
-topped up in the background; CLI `up` does not auto-refill.
+Warm pool restore applies to workspaces that do not exist yet. Hibernated
+workspaces (`--runtime gvisor`) resume from a process checkpoint on the
+same volume. `serve --pool-n N` (default 4; `0` disables; fill builds up
+to 2 slots in parallel) keeps inventory topped up in the background; CLI
+`up` does not auto-refill.
 
 Setting this up on real hardware (e.g. a Mac Mini, via a Lima Linux VM):
 run [`./dataplane-vm/install.sh`](dataplane-vm/install.sh) (interactive;
@@ -209,6 +252,20 @@ workspace). Two real bugs it found are already fixed in `dataplane/zfs.go`.
 - **Sandbox posture** (DESIGN §8): read-only rootfs, all caps dropped,
   no-new-privileges, tmpfs /tmp, `--network none` until the gateway lands,
   workspace + read-only profile as the only mounts.
+- **Workspace file API confinement.** Every read/write goes through an
+  `os.Root` bound to the workspace mount, so the kernel resolves each path —
+  including every symlink hop — at the moment of use. The agent is the
+  adversary here and it can rewrite its own directory tree; a check that
+  resolves a name and then acts on it would race.
+- **Sandboxes are isolated from each other, not just from the internet.**
+  Peer traffic on the CNI bridge is dropped (`wsnet-isolate`, installed by
+  `provision.sh`), and the terminal bridge in each sandbox demands that
+  workspace's own token, which the router derives per workspace and drops in
+  the mount. Reaching the port is not the same as being allowed a shell.
+  *Known gap:* on the Docker dev path (`--runtime runsc|runc` with a shared
+  `wsnet`) containers can still reach each other's OpenCode port (4321),
+  which has no auth of its own. The terminal is covered on both paths; the
+  agent API is not. Use the CNI path for multi-tenant work.
 
 ## Not yet implemented (next milestones)
 

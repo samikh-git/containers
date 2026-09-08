@@ -36,6 +36,24 @@ type Router struct {
 	// boot (see warm.go). Requires a Runtime implementing WarmRestorer and
 	// a Storage implementing SnapshotCloner.
 	Pool WarmPool
+	// Terminal derives the per-workspace credential the sandbox's terminal
+	// bridge demands (terminal_token.go). Nil leaves the token file alone,
+	// which fails closed: the bridge refuses connections without one.
+	Terminal *TerminalKey
+}
+
+// installTerminalToken drops the workspace's terminal credential into its
+// mount before the sandbox starts. Done for every start, warm or cold: the
+// bridge reads the file per connection, and a clone arrives holding its
+// parent's copy.
+func (r *Router) installTerminalToken(wsID, mountPath string) error {
+	if r.Terminal == nil {
+		return nil
+	}
+	if err := r.Terminal.Install(wsID, mountPath); err != nil {
+		return fmt.Errorf("terminal token: %w", err)
+	}
+	return nil
 }
 
 // prepareSession mints and registers the sandbox's session token when a
@@ -78,6 +96,15 @@ func (r *Router) revokeSessions(ctx context.Context, wsID string) {
 // Up ensures a workspace exists and its sandbox is running at the spec's
 // generation. Safe to call any number of times.
 func (r *Router) Up(ctx context.Context, spec WorkspaceSpec) (mountPath string, err error) {
+	// Resume fast path: an existing workspace hibernated with a process
+	// checkpoint restores without re-running OpenCode init.
+	if mount, handled, herr := r.resumeHibernate(ctx, spec); handled {
+		if herr == nil {
+			return mount, nil
+		}
+		fmt.Printf("warning: hibernate resume of %s failed, continuing: %v\n", spec.ID, herr)
+	}
+
 	// Warm-start fast path: a fresh workspace with a matching pool slot is
 	// restored from checkpoint. A failed claim falls through to the cold
 	// path (loudly) — warm start is an optimization, never a gate.
@@ -131,6 +158,13 @@ func (r *Router) Up(ctx context.Context, spec WorkspaceSpec) (mountPath string, 
 	}
 	if sessErr != nil {
 		return "", sessErr
+	}
+
+	if err := r.installTerminalToken(spec.ID, mountPath); err != nil {
+		return "", err
+	}
+	if err := writeSessionToken(mountPath, spec.SessionToken); err != nil {
+		return "", fmt.Errorf("session token: %w", err)
 	}
 
 	if err := r.Runtime.EnsureWorkspace(ctx, spec, mountPath); err != nil {
@@ -195,6 +229,9 @@ func (r *Router) FanOut(ctx context.Context, base WorkspaceSpec, n int) ([]strin
 		if err := r.prepareSession(ctx, &spec); err != nil {
 			return branches, err
 		}
+		if err := writeSessionToken(mount, spec.SessionToken); err != nil {
+			return branches, fmt.Errorf("session token %s: %w", branchWS, err)
+		}
 		if err := r.Runtime.EnsureWorkspace(ctx, spec, mount); err != nil {
 			return branches, fmt.Errorf("runtime %s: %w", branchWS, err)
 		}
@@ -214,14 +251,26 @@ func (r *Router) Down(ctx context.Context, wsID string) error {
 	return nil
 }
 
-// Hibernate is the scale-to-zero stop (§7): graceful stop (SIGTERM →
-// checkpoint hook → grace → kill, implemented by the runtime), then a
-// snapshot of the volume, then session revocation. For branch workspaces
-// the snapshot may fail (clones snapshot under their parent); that is
-// tolerated — the clone's data persists regardless.
+// Hibernate is the scale-to-zero stop (§7): prefer a process checkpoint
+// when the runtime implements ProcessHibernator (resume restores the
+// harness without OpenCode init); otherwise graceful stop (SIGTERM →
+// agent hook → grace → kill). Then a volume snapshot for RPO, then
+// session revocation. For branch workspaces the volume snapshot may fail
+// (clones snapshot under their parent); that is tolerated — the clone's
+// data persists regardless.
 func (r *Router) Hibernate(ctx context.Context, wsID string) error {
-	if err := r.Runtime.StopWorkspace(ctx, wsID); err != nil {
-		return err
+	mountPath, err := r.Storage.EnsureWorkspace(ctx, wsID, 0)
+	if err != nil {
+		return fmt.Errorf("storage: %w", err)
+	}
+	if _, err := r.hibernateProcess(ctx, wsID, mountPath); err != nil {
+		// hibernateProcess already attempted Stop on checkpoint failure;
+		// surface the error but still snapshot + revoke below when stop
+		// itself failed hard.
+		fmt.Printf("note: process hibernate for %s: %v\n", wsID, err)
+		if stopErr := r.Runtime.StopWorkspace(ctx, wsID); stopErr != nil {
+			return stopErr
+		}
 	}
 	snap := "hibernate-" + time.Now().UTC().Format("20060102-150405")
 	if err := r.Storage.Snapshot(ctx, wsID, snap); err != nil {

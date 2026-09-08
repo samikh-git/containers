@@ -58,6 +58,7 @@ GATEWAY_URL="${GATEWAY_URL:-http://host.docker.internal:18443/v1}"
 ROUTE="${ROUTE:-tier-a,tier-b-openrouter}"
 
 exec env GATEWAY_ADMIN_TOKEN="$GATEWAY_ADMIN_TOKEN" \
+  ROUTER_API_TOKEN="${ROUTER_API_TOKEN:-}" \
   "$ROUTER" serve \
   --storage dir --root "$ROOT" \
   --runtime "$runtime" \

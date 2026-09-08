@@ -27,7 +27,7 @@ RUNTIME="${RUNTIME:-}"          # gvisor | containerd | runsc
 START_GATEWAY=yes   # always — install leaves the stack running
 START_SERVE=yes
 FILL_POOL="${FILL_POOL:-}"
-POOL_N="${POOL_N:-2}"
+POOL_N="${POOL_N:-4}"
 SMOKE_UP="${SMOKE_UP:-}"
 EXPOSE_UI="${EXPOSE_UI:-}"
 DEPLOY_TUNNEL="${DEPLOY_TUNNEL:-}"   # Cloudflare Tunnel (DESIGN §6 tunnel mode)
@@ -232,10 +232,17 @@ gather_plan() {
     fi
   fi
   if [[ "$DEPLOY_TUNNEL" == "yes" ]]; then
+    # Required, not optional: the API answers only to loopback and to names
+    # it was told about (Host/Origin check), so a tunnel without its hostname
+    # would serve 421s to every request that arrives through it.
     if [[ -z "$TUNNEL_HOSTNAME" ]] && is_tty; then
-      ask "Public hostname for the UI (optional; configure the same in the dashboard)" ""
+      ask "Public hostname for the UI (must match the dashboard route)" ""
       TUNNEL_HOSTNAME="$REPLY"
     fi
+    [[ -n "$TUNNEL_HOSTNAME" ]] \
+      || die "TUNNEL_HOSTNAME is required when DEPLOY_TUNNEL=yes (the API only answers to names it knows)"
+    warn "the tunnel publishes this API to the internet; the ROUTER_API_TOKEN below is what stands in front of it"
+    warn "add a Cloudflare Access policy on the published application as well — one control is not a design"
     ensure_tunnel_token_plan
   fi
 
@@ -287,6 +294,19 @@ ensure_secrets_plan() {
     info "GATEWAY_ADMIN_TOKEN already set"
   fi
 
+  # ROUTER_API_TOKEN guards the whole control surface: workspace lifecycle,
+  # the workspace file API, provider-key rotation, and a root terminal in
+  # every sandbox. It is generated unconditionally rather than only for
+  # tunnel mode — "it only listens on loopback" stops being true the moment
+  # anything forwards to that loopback (a tunnel, an SSH forward, another
+  # user on the VM), and by then nobody re-reads this script.
+  if [[ -z "${ROUTER_API_TOKEN:-}" ]]; then
+    ROUTER_API_TOKEN="$(openssl rand -hex 32)"
+    info "generated ROUTER_API_TOKEN"
+  else
+    info "ROUTER_API_TOKEN already set"
+  fi
+
   write_env_file
 }
 
@@ -326,14 +346,19 @@ write_env_file() {
   local tmp
   tmp="$(mktemp)"
   if [[ -f "$ENV_FILE" ]]; then
-    grep -vE '^(ANTHROPIC_API_KEY|GATEWAY_ADMIN_TOKEN|CLOUDFLARE_TUNNEL_TOKEN|TUNNEL_HOSTNAME)=' \
+    grep -vE '^(ANTHROPIC_API_KEY|GATEWAY_ADMIN_TOKEN|ROUTER_API_TOKEN|CLOUDFLARE_TUNNEL_TOKEN|TUNNEL_HOSTNAME)=' \
       "$ENV_FILE" >"$tmp" || true
   fi
+  # if/fi rather than `[[ … ]] && printf`: under `set -e` a false test as the
+  # group's last command would abort the installer, which is exactly what
+  # happens on the common path where TUNNEL_HOSTNAME is unset.
   {
-    [[ -n "${ANTHROPIC_API_KEY:-}" ]] && printf 'ANTHROPIC_API_KEY=%s\n' "$ANTHROPIC_API_KEY"
-    [[ -n "${GATEWAY_ADMIN_TOKEN:-}" ]] && printf 'GATEWAY_ADMIN_TOKEN=%s\n' "$GATEWAY_ADMIN_TOKEN"
-    [[ -n "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]] && printf 'CLOUDFLARE_TUNNEL_TOKEN=%s\n' "$CLOUDFLARE_TUNNEL_TOKEN"
-    [[ -n "${TUNNEL_HOSTNAME:-}" ]] && printf 'TUNNEL_HOSTNAME=%s\n' "$TUNNEL_HOSTNAME"
+    for var in ANTHROPIC_API_KEY GATEWAY_ADMIN_TOKEN ROUTER_API_TOKEN \
+               CLOUDFLARE_TUNNEL_TOKEN TUNNEL_HOSTNAME; do
+      if [[ -n "${!var:-}" ]]; then
+        printf '%s=%s\n' "$var" "${!var}"
+      fi
+    done
   } >>"$tmp"
   mv "$tmp" "$ENV_FILE"
   chmod 600 "$ENV_FILE"
@@ -536,6 +561,7 @@ write_run_helpers() {
   cat >"$RUN_DIR/env" <<EOF
 ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY
 GATEWAY_ADMIN_TOKEN=$GATEWAY_ADMIN_TOKEN
+ROUTER_API_TOKEN=$ROUTER_API_TOKEN
 CLOUDFLARE_TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN:-}
 TUNNEL_HOSTNAME=${TUNNEL_HOSTNAME:-}
 EOF
@@ -609,7 +635,8 @@ IMAGE_SANDBOX="$IMAGE_SANDBOX"
 ROUTE="$ROUTE"
 # shellcheck disable=SC1091
 source "\$RUN_DIR/env"
-export GATEWAY_ADMIN_TOKEN
+export GATEWAY_ADMIN_TOKEN ROUTER_API_TOKEN
+: "\${ROUTER_API_TOKEN:?ROUTER_API_TOKEN missing in \$RUN_DIR/env — the API must not serve unauthenticated}"
 
 COMMON=(
   --storage zfs --pool tank --runtime "\$RUNTIME" --root "\$RUN_DIR/router-root"
@@ -628,10 +655,17 @@ if [[ "\$RUNTIME" == "gvisor" ]]; then
   POOL_FLAG=(--pool-n "\$POOL_N")
 fi
 
-# Bind loopback inside the VM so ROUTER_API_TOKEN is not required; reach it
-# from the Mac via the SSH local-forward installed by install.sh.
+# Bind loopback inside the VM and reach it from the Mac via the SSH
+# local-forward installed by install.sh — or, in tunnel mode, via cloudflared,
+# which is why the bind address is NOT the security boundary here and
+# ROUTER_API_TOKEN is always required. TUNNEL_HOSTNAME, when set, is also the
+# only non-loopback name the API will answer to (Host/Origin check).
+HOST_FLAG=()
+if [[ -n "\${TUNNEL_HOSTNAME:-}" ]]; then
+  HOST_FLAG=(--allowed-host "\$TUNNEL_HOSTNAME")
+fi
 nohup "\$BIN_DIR/router" serve "\${COMMON[@]}" \\
-  --listen "127.0.0.1:\${UI_PORT}" "\${POOL_FLAG[@]}" \\
+  --listen "127.0.0.1:\${UI_PORT}" "\${POOL_FLAG[@]}" "\${HOST_FLAG[@]}" \\
   >"\$RUN_DIR/serve.log" 2>&1 &
 echo \$! >"\$RUN_DIR/serve.pid"
   echo "router serve started pid=\$(cat "\$RUN_DIR/serve.pid") log=\$RUN_DIR/serve.log"
@@ -836,6 +870,11 @@ print_done() {
   Gateway URL for sandboxes: $(gateway_url)
   Runtime:                   $RUNTIME
 
+  API token (every /api request and the web terminal need it):
+    ROUTER_API_TOKEN=$ROUTER_API_TOKEN
+  The UI reads it from the URL fragment, e.g.
+    http://127.0.0.1:$UI_PORT/#token=$ROUTER_API_TOKEN
+
 EOF
   if [[ "$EXPOSE_UI" == "yes" ]]; then
     echo "  UI:  http://127.0.0.1:$UI_PORT/        (end-user)"
@@ -856,6 +895,13 @@ EOF
     echo "    dashboard: https://dash.cloudflare.com/?to=/:account/tunnels"
     echo "    Service URL must be: http://127.0.0.1:$UI_PORT"
     echo "    re-run: limactl shell $VM_NAME -- sudo bash $RUN_DIR/start-tunnel.sh"
+    echo
+    echo "    This API is now on the public internet. Two things guard it:"
+    echo "      1. ROUTER_API_TOKEN (above) — required on every request"
+    echo "      2. a Cloudflare Access policy on the published application —"
+    echo "         add one; the token alone is a single point of failure"
+    echo "    The API also refuses any Host/Origin other than loopback and"
+    echo "    $TUNNEL_HOSTNAME, so a rebinding page cannot reach it."
   fi
   echo
   cat <<EOF

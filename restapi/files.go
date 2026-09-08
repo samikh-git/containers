@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"os"
 	"path"
@@ -60,9 +61,9 @@ type fileOpRequest struct {
 func (s *Server) registerFileRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/workspaces/{id}/files", s.auth(s.fileRead))
 	mux.HandleFunc("GET /api/workspaces/{id}/files/{path...}", s.auth(s.fileRead))
-	mux.HandleFunc("PUT /api/workspaces/{id}/files/{path...}", s.auth(s.fileWrite))
-	mux.HandleFunc("POST /api/workspaces/{id}/files/{path...}", s.auth(s.fileOp))
-	mux.HandleFunc("POST /api/workspaces/{id}/files", s.auth(s.fileOp))
+	mux.HandleFunc("PUT /api/workspaces/{id}/files/{path...}", s.authJSON(s.fileWrite))
+	mux.HandleFunc("POST /api/workspaces/{id}/files/{path...}", s.authJSON(s.fileOp))
+	mux.HandleFunc("POST /api/workspaces/{id}/files", s.authJSON(s.fileOp))
 	mux.HandleFunc("DELETE /api/workspaces/{id}/files/{path...}", s.auth(s.fileDelete))
 }
 
@@ -73,74 +74,105 @@ func (s *Server) workspaceRoot(r *http.Request, id string) (string, error) {
 	return s.Router.Storage.EnsureWorkspace(r.Context(), id, s.Defaults.QuotaGB)
 }
 
-// securePath confines rel under root. Lexical cleaning kills "..", and the
-// symlink check matters because the workspace is agent-writable: a hostile
-// agent could plant `ln -s / pwn` and wait for the editor to follow it. The
-// returned path's final component may itself be a symlink — callers that
-// write/delete/rename must Lstat and refuse to operate through it.
-func securePath(root, rel string) (string, error) {
+// cleanRel turns the {path...} segment into a root-relative name for os.Root.
+// Lexical cleaning only — containment is the kernel's job below, not this
+// function's. "" and "/" both mean the workspace root itself (".").
+func cleanRel(rel string) (string, error) {
 	if strings.ContainsRune(rel, 0) {
 		return "", errors.New("invalid path")
 	}
 	if path.IsAbs(rel) || filepath.IsAbs(rel) {
 		return "", errors.New("path must be relative")
 	}
-	clean := filepath.Clean("/" + filepath.FromSlash(rel)) // "/"-anchored: cannot escape
-	target := filepath.Join(root, clean)
-
-	rootReal, err := filepath.EvalSymlinks(root)
-	if err != nil {
-		return "", fmt.Errorf("workspace root: %w", err)
+	clean := strings.TrimPrefix(path.Clean("/"+filepath.ToSlash(rel)), "/")
+	if clean == "" {
+		return ".", nil
 	}
-	// Resolve the deepest existing ancestor and check it stays inside root.
-	anc := target
-	for {
-		if real, err := filepath.EvalSymlinks(anc); err == nil {
-			if real != rootReal && !strings.HasPrefix(real, rootReal+string(filepath.Separator)) {
-				return "", errors.New("path escapes workspace")
-			}
-			break
-		} else if !os.IsNotExist(err) {
-			return "", err
-		}
-		parent := filepath.Dir(anc)
-		if parent == anc {
-			break
-		}
-		anc = parent
-	}
-	return target, nil
+	return clean, nil
 }
 
-// resolveFilePath pulls {path...} off the request and confines it. ok=false
-// means the response has been written.
-func (s *Server) resolveFilePath(w http.ResponseWriter, r *http.Request) (abs, rel string, ok bool) {
+// openWorkspace returns an os.Root confined to the workspace mount. Every
+// file operation goes through it, so path resolution — including each symlink
+// hop — is enforced by the kernel at the moment of use. That matters because
+// the workspace is agent-writable and the agent is the adversary: a check
+// that resolves a name and then acts on it can be beaten by swapping a
+// directory for a symlink in between, and this design has no such window.
+// The caller must Close the returned root.
+func (s *Server) openWorkspace(r *http.Request, id string) (*os.Root, error) {
+	mount, err := s.workspaceRoot(r, id)
+	if err != nil {
+		return nil, err
+	}
+	return os.OpenRoot(mount)
+}
+
+// resolveFile pulls {path...} off the request and opens the workspace root.
+// ok=false means the response has been written; otherwise the caller owns
+// root and must Close it.
+func (s *Server) resolveFile(w http.ResponseWriter, r *http.Request) (root *os.Root, rel string, ok bool) {
 	id, idOK := pathID(w, r)
 	if !idOK {
-		return "", "", false
+		return nil, "", false
 	}
-	root, err := s.workspaceRoot(r, id)
+	rel, err := cleanRel(r.PathValue("path"))
 	if err != nil {
-		httpError(w, http.StatusInternalServerError, err.Error())
-		return "", "", false
+		httpError(w, http.StatusBadRequest, err.Error())
+		return nil, "", false
 	}
-	rel = r.PathValue("path")
 	if isLeasePath(rel) {
 		// The lease file is fencing metadata (dataplane.FenceAndWrite), not
 		// workspace content; the editor must never read or clobber it.
 		httpError(w, http.StatusForbidden, "lease file is not editable")
-		return "", "", false
+		return nil, "", false
 	}
-	abs, err = securePath(root, rel)
+	root, err = s.openWorkspace(r, id)
 	if err != nil {
-		httpError(w, http.StatusBadRequest, err.Error())
-		return "", "", false
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return nil, "", false
 	}
-	return abs, rel, true
+	return root, rel, true
 }
 
 func isLeasePath(rel string) bool {
-	return filepath.Clean("/"+filepath.FromSlash(rel)) == "/.lease"
+	clean, err := cleanRel(rel)
+	return err == nil && clean == ".lease"
+}
+
+// fileErr maps an os.Root error onto a status. Anything the kernel refused to
+// resolve inside the workspace — a "..", an escaping symlink, a path swapped
+// under us mid-operation — is a client error, not a server fault.
+func fileErr(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		httpError(w, http.StatusNotFound, "not found")
+	case errors.Is(err, os.ErrInvalid), isEscape(err):
+		httpError(w, http.StatusBadRequest, "path escapes workspace")
+	default:
+		httpError(w, http.StatusInternalServerError, err.Error())
+	}
+}
+
+// isEscape recognizes os.Root's containment refusal ("path escapes from
+// parent"), which the standard library exposes as a plain error with no
+// sentinel to match on.
+func isEscape(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "escapes")
+}
+
+// ensureParent creates rel's parent directory if it is missing. Stat first,
+// so an existing-but-unusable parent (a symlink out of the workspace) reports
+// the escape rather than MkdirAll's bare "file exists".
+func ensureParent(root *os.Root, rel string) error {
+	dir := path.Dir(rel)
+	if dir == "." {
+		return nil
+	}
+	if _, err := root.Stat(dir); err == nil {
+		return nil
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return root.MkdirAll(dir, 0o755)
 }
 
 func contentHash(b []byte) string {
@@ -162,29 +194,37 @@ func looksBinary(b []byte) bool {
 }
 
 func (s *Server) fileRead(w http.ResponseWriter, r *http.Request) {
-	abs, _, ok := s.resolveFilePath(w, r)
+	root, rel, ok := s.resolveFile(w, r)
 	if !ok {
 		return
 	}
-	info, err := os.Lstat(abs)
+	defer root.Close()
+	info, err := root.Lstat(rel)
 	if err != nil {
-		httpError(w, http.StatusNotFound, "not found")
+		fileErr(w, err)
 		return
 	}
 	if info.Mode()&os.ModeSymlink != 0 {
-		// Follow only after securePath vetted the resolution target.
-		if info, err = os.Stat(abs); err != nil {
-			httpError(w, http.StatusNotFound, "not found")
+		// Root.Stat follows the link and refuses it if it leaves the
+		// workspace, so a planted `ln -s / pwn` reads as an escape, not as /.
+		if info, err = root.Stat(rel); err != nil {
+			fileErr(w, err)
 			return
 		}
 	}
 	if info.IsDir() {
-		entries, err := os.ReadDir(abs)
+		dir, err := root.Open(rel)
+		if err != nil {
+			fileErr(w, err)
+			return
+		}
+		entries, err := dir.ReadDir(-1)
+		dir.Close()
 		if err != nil {
 			httpError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		atRoot := filepath.Clean("/"+filepath.FromSlash(r.PathValue("path"))) == "/"
+		atRoot := rel == "."
 		out := make([]fileEntry, 0, len(entries))
 		for _, e := range entries {
 			if atRoot && e.Name() == ".lease" {
@@ -221,9 +261,9 @@ func (s *Server) fileRead(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("file exceeds %d bytes", maxFileBytes))
 		return
 	}
-	b, err := os.ReadFile(abs)
+	b, err := root.ReadFile(rel)
 	if err != nil {
-		httpError(w, http.StatusInternalServerError, err.Error())
+		fileErr(w, err)
 		return
 	}
 	if looksBinary(b) {
@@ -237,11 +277,12 @@ func (s *Server) fileRead(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) fileWrite(w http.ResponseWriter, r *http.Request) {
-	abs, rel, ok := s.resolveFilePath(w, r)
+	root, rel, ok := s.resolveFile(w, r)
 	if !ok {
 		return
 	}
-	if rel == "" {
+	defer root.Close()
+	if rel == "." {
 		httpError(w, http.StatusBadRequest, "path required")
 		return
 	}
@@ -254,7 +295,7 @@ func (s *Server) fileWrite(w http.ResponseWriter, r *http.Request) {
 
 	// Never write through a symlink: the link target was vetted at resolve
 	// time, but replacing content through a link is still surprising.
-	if info, err := os.Lstat(abs); err == nil {
+	if info, err := root.Lstat(rel); err == nil {
 		if info.Mode()&os.ModeSymlink != 0 {
 			httpError(w, http.StatusConflict, "refusing to write through a symlink")
 			return
@@ -268,9 +309,9 @@ func (s *Server) fileWrite(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if req.BaseHash != "" && !req.Force {
-			cur, err := os.ReadFile(abs)
+			cur, err := root.ReadFile(rel)
 			if err != nil {
-				httpError(w, http.StatusInternalServerError, err.Error())
+				fileErr(w, err)
 				return
 			}
 			if contentHash(cur) != req.BaseHash {
@@ -290,44 +331,46 @@ func (s *Server) fileWrite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
-		httpError(w, http.StatusInternalServerError, err.Error())
+	if err := ensureParent(root, rel); err != nil {
+		fileErr(w, err)
 		return
 	}
 	// Temp file + rename keeps a concurrently reading agent from ever seeing
-	// a half-written file.
-	tmp, err := os.CreateTemp(filepath.Dir(abs), ".editor-write-*")
+	// a half-written file. O_EXCL so we never land on a name the agent
+	// planted; both steps go through root, so neither can be redirected out
+	// of the workspace by a symlink swapped in mid-write.
+	tmpName := path.Join(path.Dir(rel), fmt.Sprintf(".editor-write-%d", time.Now().UnixNano()))
+	tmp, err := root.OpenFile(tmpName, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
-		httpError(w, http.StatusInternalServerError, err.Error())
+		fileErr(w, err)
 		return
 	}
-	tmpName := tmp.Name()
 	if _, err := tmp.WriteString(req.Content); err != nil {
 		tmp.Close()
-		os.Remove(tmpName)
+		root.Remove(tmpName)
 		httpError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
+		root.Remove(tmpName)
 		httpError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	os.Chmod(tmpName, 0o644)
-	if err := os.Rename(tmpName, abs); err != nil {
-		os.Remove(tmpName)
-		httpError(w, http.StatusInternalServerError, err.Error())
+	if err := root.Rename(tmpName, rel); err != nil {
+		root.Remove(tmpName)
+		fileErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"hash": contentHash([]byte(req.Content))})
 }
 
 func (s *Server) fileOp(w http.ResponseWriter, r *http.Request) {
-	abs, rel, ok := s.resolveFilePath(w, r)
+	root, rel, ok := s.resolveFile(w, r)
 	if !ok {
 		return
 	}
-	if rel == "" {
+	defer root.Close()
+	if rel == "." {
 		httpError(w, http.StatusBadRequest, "path required")
 		return
 	}
@@ -338,49 +381,43 @@ func (s *Server) fileOp(w http.ResponseWriter, r *http.Request) {
 	}
 	switch req.Op {
 	case "mkdir":
-		if _, err := os.Lstat(abs); err == nil {
+		if _, err := root.Lstat(rel); err == nil {
 			httpError(w, http.StatusConflict, "path exists")
 			return
 		}
-		if err := os.MkdirAll(abs, 0o755); err != nil {
-			httpError(w, http.StatusInternalServerError, err.Error())
+		if err := root.MkdirAll(rel, 0o755); err != nil {
+			fileErr(w, err)
 			return
 		}
 		writeJSON(w, http.StatusCreated, map[string]string{})
 	case "rename":
-		id, _ := pathID(w, r) // already validated by resolveFilePath
-		root, err := s.workspaceRoot(r, id)
-		if err != nil {
-			httpError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
 		if isLeasePath(req.To) {
 			httpError(w, http.StatusForbidden, "lease file is not editable")
 			return
 		}
-		dst, err := securePath(root, req.To)
+		dst, err := cleanRel(req.To)
 		if err != nil {
 			httpError(w, http.StatusBadRequest, "to: "+err.Error())
 			return
 		}
-		if req.To == "" || dst == root {
+		if req.To == "" || dst == "." {
 			httpError(w, http.StatusBadRequest, "to required")
 			return
 		}
-		if _, err := os.Lstat(abs); err != nil {
-			httpError(w, http.StatusNotFound, "not found")
+		if _, err := root.Lstat(rel); err != nil {
+			fileErr(w, err)
 			return
 		}
-		if _, err := os.Lstat(dst); err == nil {
+		if _, err := root.Lstat(dst); err == nil {
 			httpError(w, http.StatusConflict, "destination exists")
 			return
 		}
-		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-			httpError(w, http.StatusInternalServerError, err.Error())
+		if err := ensureParent(root, dst); err != nil {
+			fileErr(w, err)
 			return
 		}
-		if err := os.Rename(abs, dst); err != nil {
-			httpError(w, http.StatusInternalServerError, err.Error())
+		if err := root.Rename(rel, dst); err != nil {
+			fileErr(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{})
@@ -390,31 +427,32 @@ func (s *Server) fileOp(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) fileDelete(w http.ResponseWriter, r *http.Request) {
-	abs, rel, ok := s.resolveFilePath(w, r)
+	root, rel, ok := s.resolveFile(w, r)
 	if !ok {
 		return
 	}
-	if rel == "" {
+	defer root.Close()
+	if rel == "." {
 		httpError(w, http.StatusBadRequest, "path required")
 		return
 	}
-	info, err := os.Lstat(abs)
+	info, err := root.Lstat(rel)
 	if err != nil {
-		httpError(w, http.StatusNotFound, "not found")
+		fileErr(w, err)
 		return
 	}
 	if info.IsDir() {
 		if r.URL.Query().Get("recursive") == "1" {
-			if err := os.RemoveAll(abs); err != nil {
-				httpError(w, http.StatusInternalServerError, err.Error())
+			if err := root.RemoveAll(rel); err != nil {
+				fileErr(w, err)
 				return
 			}
-		} else if err := os.Remove(abs); err != nil {
+		} else if err := root.Remove(rel); err != nil {
 			httpError(w, http.StatusConflict, "directory not empty (use ?recursive=1)")
 			return
 		}
-	} else if err := os.Remove(abs); err != nil { // files and symlinks: removes the link, never the target
-		httpError(w, http.StatusInternalServerError, err.Error())
+	} else if err := root.Remove(rel); err != nil { // files and symlinks: removes the link, never the target
+		fileErr(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

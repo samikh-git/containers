@@ -178,21 +178,62 @@ func (p *CheckpointPool) runFill(ctx context.Context, target int) {
 	}
 }
 
-// Fill tops the pool up to n ready slots. Building is sequential — fill runs
-// off the critical path (CLI or maintenance loop), and one golden boot at a
-// time keeps resource spikes bounded.
+// Fill tops the pool up to n ready slots. Builds up to maxParallelFill
+// slots at a time so burst drain recovers faster without the resource
+// spike of booting the whole target concurrently.
 func (p *CheckpointPool) Fill(ctx context.Context, n int) (built int, err error) {
 	have, err := p.readySlots()
 	if err != nil {
 		return 0, err
 	}
-	for i := len(have); i < n; i++ {
-		if err := p.buildSlot(ctx); err != nil {
-			return built, err
-		}
-		built++
+	need := n - len(have)
+	if need <= 0 {
+		return 0, nil
 	}
-	return built, nil
+
+	const maxParallelFill = 2
+	sem := make(chan struct{}, maxParallelFill)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	var firstErr error
+
+	for i := 0; i < need; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case <-ctx.Done():
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = ctx.Err()
+				}
+				mu.Unlock()
+				return
+			case sem <- struct{}{}:
+			}
+			defer func() { <-sem }()
+
+			mu.Lock()
+			abort := firstErr != nil
+			mu.Unlock()
+			if abort {
+				return
+			}
+			if err := p.buildSlot(ctx); err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				mu.Unlock()
+				return
+			}
+			mu.Lock()
+			built++
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	return built, firstErr
 }
 
 func (p *CheckpointPool) buildSlot(ctx context.Context) error {

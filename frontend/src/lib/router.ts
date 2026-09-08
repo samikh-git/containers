@@ -74,6 +74,23 @@ export interface ProvisionSpec {
 
 const TOKEN_KEY = "router-token";
 
+// A token handed over in the URL fragment (…/#token=abc) is stored and then
+// wiped from the address bar. The fragment — not a query parameter — because
+// fragments are never sent to the server and so never reach a log or a
+// Referer header. This is how the installer hands the operator their token.
+function adoptTokenFromFragment() {
+  const hash = location.hash.startsWith("#") ? location.hash.slice(1) : location.hash;
+  if (!hash) return;
+  const params = new URLSearchParams(hash);
+  const token = params.get("token");
+  if (!token) return;
+  localStorage.setItem(TOKEN_KEY, token);
+  params.delete("token");
+  const rest = params.toString();
+  history.replaceState(null, "", location.pathname + location.search + (rest ? `#${rest}` : ""));
+}
+adoptTokenFromFragment();
+
 export function getToken(): string {
   return localStorage.getItem(TOKEN_KEY) ?? "";
 }
